@@ -1,0 +1,21 @@
+{
+  "extends": "@tsconfig/svelte/tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": false,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    // Type-time mirror of the demo's vite aliases (demo/vite.config.ts) —
+    // vite resolves the real modules at bundle time.
+    "paths": {
+      "@cxapp-ai/map-sdk": ["./src/index.ts"],
+      "@cxapp-ai/map-sdk/core": ["./src/core/index.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.svelte", "demo/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

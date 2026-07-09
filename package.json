@@ -1,0 +1,49 @@
+{
+  "name": "@cxapp-ai/map-sdk",
+  "version": "0.1.0",
+  "description": "Standalone indoor-map SDK (Jibestream/JMap) — framework-agnostic, backend-agnostic. Extracted from nova-chat-sdk's map experience.",
+  "type": "module",
+  "main": "./dist/map-sdk.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/map-sdk.js"
+    },
+    "./core": {
+      "types": "./dist/core.d.ts",
+      "default": "./dist/core.js"
+    },
+    "./global": "./dist/map-sdk.iife.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "vite build && vite build --config vite.config.iife.ts",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "dev": "vite --config demo/vite.config.ts"
+  },
+  "keywords": [
+    "indoor-map",
+    "jibestream",
+    "jmap",
+    "wayfinding",
+    "cxapp"
+  ],
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {
+    "jmap.js": "4.14.1"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.0.0",
+    "@tsconfig/svelte": "^5.0.8",
+    "@types/node": "^26.1.1",
+    "svelte": "^5.0.0",
+    "svelte-check": "^4.4.6",
+    "typescript": "^6.0.2",
+    "vite": "^8.0.0",
+    "vite-plugin-dts": "^4.5.0"
+  }
+}

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>@cxapp-ai/map-sdk demo</title>
+	<style>
+		* { box-sizing: border-box; }
+		body {
+			margin: 0;
+			padding: 16px;
+			font-family: system-ui, -apple-system, sans-serif;
+			color: #0f172a;
+			background: #f8fafc;
+		}
+		h1 { font-size: 18px; margin: 0 0 12px; }
+		h2 { font-size: 14px; margin: 16px 0 6px; }
+		.toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+		.toolbar button {
+			padding: 8px 14px;
+			border: 1px solid rgba(0,0,0,0.15);
+			border-radius: 8px;
+			background: #fff;
+			font: inherit;
+			font-size: 13px;
+			cursor: pointer;
+		}
+		.toolbar button:hover { background: #f1f5f9; }
+		/* The SDK requires a SIZED container at mount — 0×0 errors. */
+		#map {
+			width: 100%;
+			max-width: 960px;
+			height: 70vh;
+			min-height: 420px;
+			border: 1px solid rgba(0,0,0,0.12);
+			border-radius: 12px;
+			overflow: hidden;
+			background: #fff;
+		}
+		#log {
+			max-width: 960px;
+			height: 180px;
+			overflow-y: auto;
+			margin: 0;
+			padding: 10px;
+			border: 1px solid rgba(0,0,0,0.12);
+			border-radius: 8px;
+			background: #0f172a;
+			color: #a5f3a5;
+			font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+			font-size: 12px;
+			line-height: 1.5;
+			white-space: pre-wrap;
+		}
+	</style>
+</head>
+<body>
+	<h1>@cxapp-ai/map-sdk demo</h1>
+	<div class="toolbar">
+		<button id="btn-fullscreen">Enter fullscreen</button>
+		<button id="btn-itinerary">Draw itinerary</button>
+		<button id="btn-gps">GPS mock: off</button>
+		<button id="btn-focus">Focus 2nd resource</button>
+	</div>
+	<div id="map"></div>
+	<h2>mapsdk:* CustomEvent log (listened on the container)</h2>
+	<pre id="log"></pre>
+	<script type="module" src="/main.ts"></script>
+</body>
+</html>
