@@ -70,21 +70,219 @@ map.setFullscreen(true);
 map.destroy(); // mandatory teardown
 ```
 
-## Script-tag / WebView hosts (no bundler)
+## Host integration recipes
+
+The API is the same everywhere: `mountIndoorMap(container, options)` returns a
+handle; you drive the map through the handle and tear it down with `destroy()`.
+Only the *lifecycle wiring* differs per host.
+
+**Golden rules (all hosts):**
+1. **Mount once, keep the handle.** Do not call `mountIndoorMap` on every
+   render / change-detection tick — the engine is expensive to build.
+2. **Always `destroy()` on teardown** (route change, unmount, screen close). It
+   stops the RAF projection loop, the geolocation watch, the auth-refresh timer,
+   and the JMap controller. Skipping it leaks all of them.
+3. **Drive changes through handle methods** (`setResources`, `setItinerary`,
+   `setFloor`, `update`, …), never by remounting. (Note `setResources` and some
+   `update()` fields are a full reload — see *Runtime updates & rebuild cost*.)
+4. **The container must have a non-zero size before mount** (0×0 errors).
+
+Every callback in `options.on` is ALSO a bubbling DOM CustomEvent on the
+container — `mapsdk:ready`, `mapsdk:resourceselect`, `mapsdk:floorchange`,
+`mapsdk:bookrequested`, `mapsdk:bookingstatechange` (pending/confirmed/failed),
+`mapsdk:navigaterequested`, `mapsdk:fullscreenchange`, `mapsdk:error` — payload
+in `event.detail`. Web hosts can use either channel; native WebView shells use
+the DOM-event channel (below).
+
+### React
+
+```tsx
+import { useEffect, useRef } from 'react';
+import { mountIndoorMap, type IndoorMapHandle } from '@cxapp-ai/map-sdk';
+
+export function IndoorMap({ venueId, resources }: Props) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<IndoorMapHandle | null>(null);
+
+  // Mount ONCE — empty deps. StrictMode double-invokes this in dev
+  // (mount → destroy → mount); destroy() makes that safe.
+  useEffect(() => {
+    const map = mountIndoorMap(containerRef.current!, {
+      provider: {
+        host: 'https://api.jibestream.com',
+        customerId: 146,
+        venueId,
+        auth: { getToken: () => api.mintJibestreamToken() },
+      },
+      resources,
+      gps: true,
+      on: {
+        onResourceSelect: (r) => console.log(r.name),
+        onError: (e) => console.error(e.message),
+      },
+    });
+    mapRef.current = map;
+    return () => { map.destroy(); mapRef.current = null; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Push prop changes through the handle. Guard so you only pay the
+  // setResources reload when the set truly changes.
+  useEffect(() => { mapRef.current?.setResources(resources); }, [resources]);
+
+  return <div ref={containerRef} style={{ width: '100%', height: '100%' }} />;
+}
+```
+
+### Angular
+
+```ts
+import { Component, ElementRef, NgZone, OnDestroy, OnInit, ViewChild } from '@angular/core';
+import { mountIndoorMap, type IndoorMapHandle } from '@cxapp-ai/map-sdk';
+
+@Component({
+  selector: 'indoor-map',
+  standalone: true,
+  template: `<div #host style="width:100%;height:100%"></div>`,
+})
+export class IndoorMapComponent implements OnInit, OnDestroy {
+  @ViewChild('host', { static: true }) host!: ElementRef<HTMLDivElement>;
+  private map?: IndoorMapHandle;
+  constructor(private zone: NgZone, private api: Api) {}
+
+  ngOnInit() {
+    // Mount OUTSIDE Angular — the perpetual RAF loop would otherwise trigger
+    // change detection ~60×/sec. Hop back into the zone inside callbacks.
+    this.zone.runOutsideAngular(() => {
+      this.map = mountIndoorMap(this.host.nativeElement, {
+        provider: { host: 'https://api.jibestream.com', customerId: 146, venueId: 2407,
+                    auth: { getToken: () => this.api.token() } },
+        gps: true,
+        on: { onResourceSelect: (r) => this.zone.run(() => this.select(r)) },
+      });
+    });
+  }
+  ngOnDestroy() { this.map?.destroy(); }
+}
+```
+
+### Vue 3
+
+```vue
+<script setup lang="ts">
+import { onMounted, onBeforeUnmount, ref } from 'vue';
+import { mountIndoorMap, type IndoorMapHandle } from '@cxapp-ai/map-sdk';
+
+const host = ref<HTMLDivElement>();
+let map: IndoorMapHandle | undefined;
+
+onMounted(() => {
+  map = mountIndoorMap(host.value!, {
+    provider: { host: 'https://api.jibestream.com', customerId: 146, venueId: 2407,
+                auth: { getToken: () => api.token() } },
+    gps: true,
+    on: { onResourceSelect: (r) => console.log(r.name) },
+  });
+});
+onBeforeUnmount(() => map?.destroy());
+</script>
+
+<template><div ref="host" style="width:100%;height:100%"></div></template>
+```
+
+### Plain JS / no bundler (`<script>` tag)
 
 ```html
+<div id="map" style="position:fixed;inset:0"></div>
 <script src="map-sdk.iife.js"></script>
 <script>
   const map = MapSDK.mountIndoorMap(document.getElementById('map'), { /* same options */ });
 </script>
 ```
 
-Every callback is also a bubbling DOM CustomEvent on the container —
-`mapsdk:resourceselect`, `mapsdk:floorchange`, `mapsdk:bookrequested`,
-`mapsdk:bookingstatechange` (booking lifecycle: pending/confirmed/failed),
-`mapsdk:navigaterequested`, `mapsdk:fullscreenchange`, `mapsdk:ready`,
-`mapsdk:error` — payload in `event.detail`. Native iOS/Android shells hosting
-a WebView can bridge those without touching the bundle.
+### Native iOS / Android WebView
+
+Ship a small HTML page that loads `map-sdk.iife.js`, mount the map, expose the
+handle globally so native can call **in**, forward `mapsdk:*` events **out**,
+and bridge `auth.getToken` to a native token mint. The page:
+
+```html
+<div id="map" style="position:fixed;inset:0"></div>
+<script src="map-sdk.iife.js"></script>
+<script>
+  // (1) getToken bridge: JS asks native to mint a JACS token; native replies by
+  //     calling window.__resolveToken(id, token, ttl). Correlate by request id.
+  const pending = {};
+  let seq = 0;
+  window.__resolveToken = (id, accessToken, expiresInSeconds) =>
+    pending[id]?.({ accessToken, expiresInSeconds });
+  function getToken() {
+    const id = ++seq;
+    return new Promise((resolve) => {
+      pending[id] = resolve;
+      window.webkit?.messageHandlers?.mintToken?.postMessage({ id }); // iOS
+      window.AndroidBridge?.mintToken?.(id);                          // Android
+    });
+  }
+
+  // (2) Mount; keep the handle on window so native can call methods on it.
+  const el = document.getElementById('map');
+  const map = window.__map = MapSDK.mountIndoorMap(el, {
+    provider: { host: 'https://api.jibestream.com', customerId: 146, venueId: 2407, auth: { getToken } },
+    mode: 'fullscreen',
+    gps: true,
+  });
+
+  // (3) Forward map events OUT to native.
+  const forward = (e) => {
+    const msg = JSON.stringify({ type: e.type, detail: e.detail });
+    window.webkit?.messageHandlers?.mapEvent?.postMessage(msg); // iOS
+    window.AndroidBridge?.onMapEvent?.(msg);                    // Android
+  };
+  ['mapsdk:ready','mapsdk:resourceselect','mapsdk:floorchange','mapsdk:bookrequested',
+   'mapsdk:bookingstatechange','mapsdk:navigaterequested','mapsdk:fullscreenchange','mapsdk:error']
+    .forEach((t) => el.addEventListener(t, forward));
+</script>
+```
+
+**iOS (WKWebView, Swift)** — register the `mintToken` + `mapEvent` handlers, and
+call into the map with `evaluateJavaScript`:
+
+```swift
+// config.userContentController.add(self, name: "mintToken"); add(self, name: "mapEvent")
+func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+  switch m.name {
+  case "mintToken":
+    let id = (m.body as! [String: Any])["id"] as! Int
+    mintJACSToken { token in
+      self.webView.evaluateJavaScript("window.__resolveToken(\(id), '\(token)', 3000)")
+    }
+  case "mapEvent":
+    handleMapEvent(m.body as! String) // JSON { type, detail }
+  default: break
+  }
+}
+// Call in, e.g. switch floors:  webView.evaluateJavaScript("window.__map.setFloor(3)")
+```
+
+**Android (Kotlin)** — expose a `@JavascriptInterface` bridge and call in with
+`evaluateJavascript`:
+
+```kotlin
+webView.addJavascriptInterface(object {
+  @JavascriptInterface fun mintToken(id: Int) {
+    mintJACSToken { token ->
+      runOnUiThread { webView.evaluateJavascript("window.__resolveToken($id, '$token', 3000)", null) }
+    }
+  }
+  @JavascriptInterface fun onMapEvent(json: String) { handleMapEvent(json) }
+}, "AndroidBridge")
+// Call in, e.g.:  webView.evaluateJavascript("window.__map.setFloor(3)", null)
+```
+
+Tear down by calling `window.__map.destroy()` before the WebView is
+released. See the *Security & host caveats* below re: `cdn.jibestream.com`
+(NavigationKit) — if your WebView enforces a CSP, either allow that origin or
+mount with `autoReroute: false`.
 
 ## Runtime updates & rebuild cost
 
