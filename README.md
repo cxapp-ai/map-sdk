@@ -94,9 +94,11 @@ self-inject — there is no stylesheet to import.
 
 Jibestream token/venue caches are keyed per config **including auth
 identity** (the `getToken` callback / `clientId`), so remounting with
-different credentials never reuses a previous user's token.
-`clearJibestreamCaches()` (exported from both entries) is a hard-reset
-escape hatch.
+different credentials never reuses a previous user's token. The cache is
+capped (oldest entries evicted) and a fresh `getToken` closure counts as a
+new identity — hoist `getToken` to a stable reference to reuse the cache
+across remounts. `clearJibestreamCaches()` (exported from both entries) is a
+hard-reset escape hatch.
 
 ## Repo layout
 

@@ -1,4 +1,5 @@
-import { writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync } from 'node:fs';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
@@ -13,22 +14,15 @@ import { cssInjectedByJs } from './css-inject.plugin';
 //
 // Declarations: `rollupTypes: true` (API Extractor) cannot trace the
 // .svelte/.svelte.ts mount layer and emits empty `export {}` entry files, so
-// instead we emit per-file d.ts for the pure-TS surface only and hand-author
-// the two entry declarations (dist/index.d.ts, dist/core.d.ts) that
-// package.json#exports points at. Keep INDEX_DTS in sync with src/index.ts
-// (mountIndoorMap's signature lives in src/mount.svelte.ts) and CORE_DTS in
-// sync with src/core/index.ts.
-const INDEX_DTS = `import type { IndoorMapHandle, MapSdkOptions } from './types.js';
-export declare function mountIndoorMap(container: HTMLElement, options: MapSdkOptions): IndoorMapHandle;
-export { cxaiNavigationPlugin } from './plugins/cxai.js';
-export { clearJibestreamCaches } from './core/jibestream.js';
-export type * from './types.js';
-export { DEFAULT_STRINGS } from './strings.js';
-export { DEFAULT_THEME } from './theme.js';
-`;
+// instead we emit per-file d.ts for the pure-TS surface and:
+//   - `.`      → dist/index.d.ts is src/index.public.d.ts copied verbatim
+//                (committed, tsc-checked; drift-guarded by
+//                src/index.assert-public.ts under `npm run check`);
+//   - `./core` → dist/core/index.d.ts, emitted directly from
+//                src/core/index.ts by the dts plugin.
 
-const CORE_DTS = `export * from './core/index.js';
-`;
+const rootDir = fileURLToPath(new URL('.', import.meta.url));
+const distDir = path.join(rootDir, 'dist');
 
 export default defineConfig({
   plugins: [
@@ -39,7 +33,7 @@ export default defineConfig({
       entryRoot: 'src',
       // The TS-only public surface. src/index.ts and the Svelte view layer
       // (mount.svelte.ts, src/ui/) are deliberately excluded — their public
-      // types are covered by the hand-authored entries below.
+      // types are covered by the hand-authored src/index.public.d.ts.
       include: [
         'src/types.ts',
         'src/strings.ts',
@@ -48,15 +42,39 @@ export default defineConfig({
         'src/core/**/*.ts',
       ],
       // entryRoot alone still nests output under dist/src/ — flatten it so
-      // the hand-authored entries' relative imports (./types.js, ./core/…)
+      // the hand-authored entry's relative imports (./types.js, ./core/…)
       // resolve.
-      beforeWriteFile: (filePath, content) => ({
-        filePath: filePath.replace('/dist/src/', '/dist/'),
-        content,
-      }),
+      beforeWriteFile: (filePath, content) => {
+        const srcDir = path.join(distDir, 'src');
+        const rel = path.relative(srcDir, filePath);
+        // Only flatten files nested under dist/src/; leave anything else as-is.
+        const flattened = rel.startsWith('..') || path.isAbsolute(rel)
+          ? filePath
+          : path.join(distDir, rel);
+        return { filePath: flattened, content };
+      },
       afterBuild() {
-        writeFileSync(fileURLToPath(new URL('dist/index.d.ts', import.meta.url)), INDEX_DTS);
-        writeFileSync(fileURLToPath(new URL('dist/core.d.ts', import.meta.url)), CORE_DTS);
+        copyFileSync(path.join(rootDir, 'src', 'index.public.d.ts'), path.join(distDir, 'index.d.ts'));
+        // Post-condition: every declaration the two entry d.ts files import
+        // must exist, or consumers get a silently-broken type surface (e.g.
+        // if the flattening above or the include list regresses).
+        const required = [
+          'index.d.ts',
+          'types.d.ts',
+          'strings.d.ts',
+          'theme.d.ts',
+          'plugins/cxai.d.ts',
+          'core/index.d.ts',
+          'core/engine.d.ts',
+          'core/jibestream.d.ts',
+        ];
+        const missing = required.filter((f) => !existsSync(path.join(distDir, f)));
+        if (missing.length > 0) {
+          throw new Error(
+            `[map-sdk] declaration post-condition failed — missing: ${missing.join(', ')} `
+            + '(check the dts include list / beforeWriteFile flattening in vite.config.ts)',
+          );
+        }
       },
     }),
   ],

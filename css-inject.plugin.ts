@@ -36,8 +36,9 @@ export function cssInjectedByJs(entryChunkName = 'index'): Plugin {
 			// Prefer the named UI entry (`index`); the /core entry has no CSS.
 			const target = chunks.find((c) => c.name === entryChunkName) ?? chunks[0];
 			if (!target) {
-				this.warn('css-injected-by-js: no entry chunk found; CSS was dropped');
-				return;
+				// Hard failure: the CSS assets were already deleted above, so
+				// continuing would ship an unstyled (broken) artifact.
+				this.error('css-injected-by-js: no entry chunk found to inject CSS into');
 			}
 			// Appended AFTER the chunk body so existing sourcemap segments stay
 			// aligned (the injector itself is unmapped, which is fine).

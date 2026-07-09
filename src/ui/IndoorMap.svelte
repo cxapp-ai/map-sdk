@@ -87,15 +87,6 @@
 	}
 
 	/**
-	 * Two-letter initials for a colleague. Ported from
-	 * src/services/colleagues.ts, adapted to the SDK's flat ColleagueBooking
-	 * contract (a single `name` field — no firstName/lastName split).
-	 */
-	function initialsForColleague(b: ColleagueBooking): string {
-		return initials(b.name);
-	}
-
-	/**
 	 * Safely read the (host-opaque) bookingContext's date window. The chat
 	 * host threads `{startDate, endDate}` YMD strings through it; hosts that
 	 * don't leave the colleague overlay on its "today" fallback.
@@ -179,6 +170,7 @@
 	// its original fallback (see src/theme.ts for the per-usage nuances).
 	const themeStyle = $derived(
 		Object.entries(theme ?? {})
+			.filter(([, v]) => v != null)
 			.map(([k, v]) => `${k.startsWith('--') ? k : `--map-${k}`}: ${v};`)
 			.join(' '),
 	);
@@ -227,11 +219,6 @@
 					}
 				: null,
 	);
-	// True when `venueCenter` is a real venue coordinate (explicit config or
-	// the bbox midpoint). The distance chip uses this so a host that
-	// configures only `venueCenter` (no bounds) still gets a venue-centre
-	// distance, while a host that configures NEITHER never sees the chip.
-	const hasTrustedVenueCenter = $derived(venueCenter != null);
 
 	type LoadState = 'idle' | 'loading' | 'ready' | 'error';
 
@@ -766,10 +753,10 @@
 		if (!away) return null;
 
 		// Coupling #14: no hardcoded default venue centre. Without an explicit
-		// venueCenter or venueBounds-derivable centre the chip has no
-		// trustworthy anchor, so it hides entirely rather than measuring a
-		// distance to a made-up point.
-		if (!hasTrustedVenueCenter) return null;
+		// venueCenter or venueBounds-derivable centre (the shared `venueCenter`
+		// derivation) the chip has no trustworthy anchor, so it hides entirely
+		// rather than measuring a distance to a made-up point.
+		if (venueCenter == null) return null;
 
 		// Distance anchor differs by away-case to avoid a stale projection:
 		//  - Outside bbox (atVenue===false): live coords → venue centre (proj.world
@@ -1041,6 +1028,16 @@
 		// Pre-load thumbnails for every carousel card. The image loader (or the
 		// browser cache on the passthrough path) dedupes repeated paths.
 		resources.forEach((r, i) => { void loadThumb(r, i); });
+		// Prune entries for resources no longer in the list so a long-lived map
+		// that cycles resource sets (handle.setResources) doesn't accumulate
+		// stale data-URL thumbnails. untrack: writes to `thumbs` (also written
+		// by loadThumb) must not re-trigger this effect.
+		const live = new Set(resources.map((r, i) => carouselKey(r, i)));
+		untrack(() => {
+			for (const key of Object.keys(thumbs)) {
+				if (!live.has(key)) delete thumbs[key];
+			}
+		});
 	});
 
 	// Pin lookup across ALL floors so the carousel can drive cross-floor
@@ -1583,18 +1580,12 @@
 		tearDown();
 	});
 
-	// Itinerary presentation options. The public contract (types.ts) encodes
-	// `style` as a preset name and `pathType` as a number; the engine's
-	// drawItinerary takes a JMap style object and a path-type NAME. v1: both
-	// style presets render JMap's built-in default path style (the engine's
-	// style object has no dash support), and pathType is stringified — it is
-	// a documented no-op in jmap.js v4 either way, kept for parity.
+	// Itinerary presentation options. The public contract (types.ts) also
+	// declares `style` and `pathType`, but both are documented-inert in v1
+	// (no engine style-preset support; pathType is a no-op in jmap.js v4), so
+	// neither is threaded to the engine's drawItinerary.
 	const itineraryStartFromMapCenter = $derived(itineraryOptions?.startFromMapCenter ?? false);
 	const itineraryShowStopNumbers = $derived(itineraryOptions?.showStopNumbers);
-	const itineraryStyle: { stroke?: string; strokeWidth?: number; strokeOpacity?: number } | undefined = undefined;
-	const itineraryPathType = $derived(
-		itineraryOptions?.pathType != null ? String(itineraryOptions.pathType) : undefined,
-	);
 
 	// Stable signature so the wayfinding effect only fires when itinerary
 	// content or render-affecting opts change — not on every parent re-render
@@ -1604,15 +1595,14 @@
 	// reappears. startFromMapCenter is in the signature because the synthetic
 	// start is anchored to whichever floor is showing, so toggling it (or
 	// switching floors) must redraw with a fresh centre waypoint.
-	// `itineraryOptions.style` is deliberately NOT in the signature: it is a
-	// v1 no-op (see itineraryStyle above), so toggling it must not trigger a
-	// redraw that renders identically. Re-add it when the presets get wired.
+	// `itineraryOptions.style`/`pathType` are deliberately NOT in the
+	// signature: they are v1 no-ops (see above), so toggling them must not
+	// trigger a redraw that renders identically. Re-add when they get wired.
 	const itinerarySig = $derived(
 		JSON.stringify(itinerary ?? [])
 		+ '|' + (selectedMapId ?? '')
 		+ '|' + (itineraryStartFromMapCenter ? '1' : '0')
-		+ '|' + (itineraryShowStopNumbers ?? 'auto')
-		+ '|' + (itineraryPathType ?? ''),
+		+ '|' + (itineraryShowStopNumbers ?? 'auto'),
 	);
 
 	// Wire itinerary prop → MinimapInstance.drawItinerary. Runs after load
@@ -1633,9 +1623,7 @@
 		if (!untrack(() => gpsSettled)) return;
 		const stops = untrack(() => (itinerary ?? []).slice());
 		const startFromMapCenter = untrack(() => itineraryStartFromMapCenter);
-		const style = itineraryStyle;
 		const showStopNumbers = untrack(() => itineraryShowStopNumbers);
-		const pathType = untrack(() => itineraryPathType);
 		const minStops = startFromMapCenter ? 1 : 2;
 		const inst = mm;
 		if (!inst) return;
@@ -1677,9 +1665,7 @@
 			let result = inst.drawItinerary(stops, {
 				startFromMapCenter,
 				startCoordinate,
-				style,
 				showStopNumbers,
-				pathType,
 			});
 			// Fall back to the kiosk/centre start (drop startCoordinate so the
 			// startFromMapCenter tiers run) in two cases:
@@ -1705,9 +1691,7 @@
 			if (startCoordinate && (result.drawn === 0 || gpsStartDropped)) {
 				result = inst.drawItinerary(stops, {
 					startFromMapCenter,
-					style,
 					showStopNumbers,
-					pathType,
 				});
 			}
 			const synth = result?.syntheticStart ?? null;
@@ -1753,7 +1737,7 @@
 	<div class="rm-modal-canvas-wrap">
 		<div bind:this={container} class="rm-canvas"></div>
 		{#if load === 'ready' && !switchingFloor}
-			{@render pinList(positions, true)}
+			{@render pinList(positions)}
 			{@render routeStartMarker(startPos)}
 			{@render youAreHereMarker(routeForcesNativeDot ? null : onMapPos(userOverlay))}
 			{#if colleaguesEnabled}
@@ -1845,14 +1829,13 @@
 	{/if}
 {/snippet}
 
-{#snippet pinList(items: Array<{ pin: PinInfo; x: number; y: number } | null>, large: boolean)}
+{#snippet pinList(items: Array<{ pin: PinInfo; x: number; y: number } | null>)}
 	{#each items as item}
 		{#if item}
 			{@const isDest = routeActive && destIds.has(String(item.pin.resource.externalId ?? ''))}
 			<button
 				type="button"
-				class="rm-pin rm-pin-teardrop"
-				class:rm-pin-large={large}
+				class="rm-pin"
 				class:rm-pin-selected={!!selectedPin && item.pin === selectedPin}
 				class:rm-pin-dest={isDest}
 				style="left: {item.x}px; top: {item.y}px;"
@@ -1888,7 +1871,7 @@
 					<img class="rm-avatar-img" src={photo.url} alt={name} />
 				{:else}
 					<div class="rm-avatar-fallback" style="background-color: {colorForName(name)};">
-						{initialsForColleague(item.marker.booking)}
+						{initials(item.marker.booking.name)}
 					</div>
 				{/if}
 			</div>
@@ -1897,8 +1880,7 @@
 {/snippet}
 
 {#snippet floorStrip()}
-	{#if floors.length > 1}
-	<div class="rm-floor-select rm-floor-select-modal">
+	<div class="rm-floor-select">
 		{#each floors as f (f.mapId)}
 			<button
 				type="button"
@@ -1911,13 +1893,12 @@
 			</button>
 		{/each}
 	</div>
-	{/if}
 {/snippet}
 
 {#snippet resourceCarousel()}
 	{@const single = resources.length <= 1}
 	<div
-		class="rm-carousel {single ? 'rm-carousel-single' : ''} rm-carousel-modal"
+		class="rm-carousel {single ? 'rm-carousel-single' : ''}"
 		class:rm-carousel-dragging={isDragging}
 		role="group"
 		aria-label={t.suggestedSpaces}
@@ -2128,8 +2109,8 @@
 	.rm-pin {
 		position: absolute;
 		transform: translate(-50%, -100%);
-		width: 28px;
-		height: 28px;
+		width: 36px;
+		height: 36px;
 		border: none;
 		background: transparent;
 		padding: 0;
@@ -2139,14 +2120,16 @@
 		align-items: center;
 		justify-content: center;
 	}
-	.rm-pin-large { width: 36px; height: 36px; }
 	/* Brand-blue teardrop location pin (all tenants). currentColor ← token. */
-	.rm-pin-teardrop-icon { color: var(--map-primary, #0070F0); filter: drop-shadow(0 3px 6px rgba(0,0,0,0.35)); }
-	.rm-pin-large .rm-pin-teardrop-icon { width: 28px; height: 36px; }
+	.rm-pin-teardrop-icon {
+		color: var(--map-primary, #0070F0);
+		filter: drop-shadow(0 3px 6px rgba(0,0,0,0.35));
+		width: 28px;
+		height: 36px;
+	}
 	/* Route destination renders a touch larger + above other pins. */
 	.rm-pin-dest { z-index: 6; }
-	.rm-pin-dest .rm-pin-teardrop-icon { width: 26px; height: 33px; }
-	.rm-pin-large.rm-pin-dest .rm-pin-teardrop-icon { width: 34px; height: 43px; }
+	.rm-pin-dest .rm-pin-teardrop-icon { width: 34px; height: 43px; }
 
 	/* Colleague avatar overlay — layered above pins so they remain the
 	   visually dominant marker for the currently-relevant resource. */
@@ -2248,14 +2231,18 @@
 		pointer-events: none;
 	}
 
+	/* Floor strip is a solid surface above the canvas — belt-and-suspenders so
+	   nothing shows through beneath the buttons. */
 	.rm-floor-select {
 		display: flex;
 		align-items: center;
 		gap: 4px;
 		padding: 8px 12px;
-		border-top: 1px solid var(--map-border, rgba(0,0,0,0.06));
+		border-top: 1px solid rgba(0,0,0,0.08);
+		position: relative;
+		z-index: 11;
+		background: #fff;
 	}
-	.rm-floor-select-modal { border-top: 1px solid rgba(0,0,0,0.08); }
 	.rm-floor-tab {
 		flex: 1;
 		min-height: 36px;
@@ -2345,14 +2332,6 @@
 		overflow: hidden;
 		background: var(--map-surface-elevated, rgba(0,0,0,0.04));
 	}
-	/* Floor strip is a solid surface above the canvas — belt-and-suspenders so
-	   nothing shows through beneath the buttons. */
-	.rm-floor-select-modal {
-		position: relative;
-		z-index: 11;
-		background: #fff;
-	}
-
 	@keyframes rm-spin { to { transform: rotate(360deg); } }
 
 	/* ─── Resource carousel (in-map; replaces the floating pin popup) ───
@@ -2385,9 +2364,9 @@
 		background: transparent;
 		z-index: 30;
 		/* Vertical padding for soft card shadow; horizontal padding computed so
-		   the first AND last cards can centre-snap, and bumped above 20px so
+		   the first AND last cards can centre-snap, and bumped above 24px so
 		   on mobile the card never visually hugs the screen border. */
-		padding: 8px max(20px, calc(50% - 240px));
+		padding: 12px max(24px, calc(50% - 260px));
 	}
 	.rm-carousel.rm-carousel-dragging {
 		scroll-snap-type: none;
@@ -2397,21 +2376,19 @@
 	.rm-carousel-single {
 		overflow-x: hidden;
 		justify-content: center;
-		padding: 8px 20px;
 	}
-	.rm-carousel-modal { padding: 12px max(24px, calc(50% - 260px)); }
 	.rm-carousel-card {
 		flex: 0 0 auto;
 		box-sizing: border-box;
 		/* Width: a generous viewport-relative target on small screens (so the
-		   card dominates with a peek of neighbours) capped at 480 px on wide
+		   card dominates with a peek of neighbours) capped at 520 px on wide
 		   screens. The `max-width: calc(100% - 40px)` clamp is the SAFETY
 		   NET — it caps the card to the container width minus 40 px so the
 		   card never grazes the container's edges. Without this, on a 375 px
 		   phone where the canvas is only ~327 px wide, the 82 vw card
-		   (307 px) plus the carousel's 2×20 px padding (40 px) totals 347 px
-		   — more than the canvas, so the card visibly overflowed. */
-		width: min(82vw, 480px);
+		   (307 px) plus the carousel's horizontal padding totals more than
+		   the canvas, so the card visibly overflowed. */
+		width: min(82vw, 520px);
 		max-width: calc(100% - 40px);
 		min-width: 200px;
 		scroll-snap-align: center;
@@ -2432,7 +2409,6 @@
 		-webkit-user-select: none;
 		-webkit-tap-highlight-color: transparent;
 	}
-	.rm-carousel-modal .rm-carousel-card { width: min(82vw, 520px); }
 	.rm-carousel-single .rm-carousel-card {
 		width: min(90vw, 480px);
 		cursor: default;
@@ -2581,13 +2557,9 @@
 	   card's pin stands out, paired with the pulsing halo below. This mirrors
 	   the `.rm-pin-dest` sizing. */
 	.rm-pin-selected .rm-pin-teardrop-icon {
-		width: 30px;
-		height: 38px;
-		filter: drop-shadow(0 4px 8px rgba(15,23,42,0.5));
-	}
-	.rm-pin-large.rm-pin-selected .rm-pin-teardrop-icon {
 		width: 38px;
 		height: 48px;
+		filter: drop-shadow(0 4px 8px rgba(15,23,42,0.5));
 	}
 	/* Halo pulse around the selected pin. Uses `rm-pulse-selected` (not the
 	   shared `rm-pulse`) because the shared keyframes set `transform: scale(...)`
@@ -2599,16 +2571,12 @@
 		position: absolute;
 		left: 50%;
 		top: 50%;
-		width: 44px;
-		height: 44px;
+		width: 56px;
+		height: 56px;
 		border-radius: 50%;
 		background: rgba(15,23,42,0.22);
 		animation: rm-pulse-selected 2s ease-out infinite;
 		pointer-events: none;
-	}
-	.rm-pin-large.rm-pin-selected::before {
-		width: 56px;
-		height: 56px;
 	}
 	@keyframes rm-pulse-selected {
 		0%   { transform: translate(-50%, -50%) scale(1);   opacity: 0.7; }

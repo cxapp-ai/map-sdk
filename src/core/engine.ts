@@ -20,6 +20,8 @@ import {
 	resolveDestination,
 	getToken,
 	peekTokenExpiry,
+	jibLogWith,
+	makeJibLog,
 } from './jibestream.js';
 
 import type {
@@ -60,10 +62,8 @@ const MAP_SETTLE_MS = 600;
 
 // Injectable logger (coupling #13): the chat SDK's logger import is replaced
 // by an optional MapLogger threaded through createMinimap opts. No logger =
-// no output. The `[jibestream:<stage>]` prefix format is preserved.
-function jibLogWith(logger: MapLogger | undefined, stage: string, msg: string, extra?: unknown): void {
-	logger?.debug?.(`[jibestream:${stage}]`, msg, extra ?? '');
-}
+// no output. jibLogWith/makeJibLog (imported from ./jibestream.js) preserve
+// the `[jibestream:<stage>]` prefix format.
 
 // --- JMap typings -------------------------------------------------------------
 
@@ -100,13 +100,11 @@ type JmapModule = {
 const REFRESH_SKEW_MS = 30_000;
 const MIN_REFRESH_INTERVAL_MS = 60_000; // floor to avoid tight loops on tiny TTLs.
 
-/** @internal Exported for tests; not part of the public API. */
-export async function buildHostTokenAuth(cfg: JibestreamConfig, logger?: MapLogger): Promise<{
+async function buildHostTokenAuth(cfg: JibestreamConfig, logger?: MapLogger): Promise<{
 	auth: unknown;
 	dispose: () => void;
 }> {
-	const jibLog = (stage: string, msg: string, extra?: unknown): void =>
-		jibLogWith(logger, stage, msg, extra);
+	const jibLog = makeJibLog(logger);
 	let currentToken = await getToken(cfg, logger);
 	let timer: ReturnType<typeof setTimeout> | null = null;
 	let disposed = false;
@@ -208,7 +206,6 @@ interface JController {
 	addDragPan?: () => void;
 	addPinchZoom?: () => void;
 	addMouseWheelZoom?: () => void;
-	resize?: (width?: number, height?: number) => unknown;
 	destroy?: () => void;
 	activeVenue?: ActiveVenueLike;
 	jungle?: JungleLike;
@@ -230,11 +227,17 @@ interface JController {
 	renderCurrentMapView?: () => unknown;
 	_getParsedMapView?: (map: unknown) => MapViewLike | undefined;
 	showAllPathTypes?: () => void;
-	showPathType?: (type: string) => void;
-	hidePathType?: (type: string) => void;
 }
 
 interface UnitBounds { x: number; y: number; width: number; height: number; }
+
+// JMap stores a Map model's width/height under a `_` private bag (the public
+// Map instance only exposes `_` and `uris` as enumerable keys), so
+// `mapObj.size` is undefined — read `_.size`, falling back to `_.width`/
+// `_.height` if present. See floorSizeWorld in createMinimap.
+type JMapPrivateSizeBag = {
+	_?: { size?: { width?: number; height?: number }; width?: number; height?: number };
+};
 
 // --- JACS request interceptor ------------------------------------------------
 
@@ -473,14 +476,6 @@ export interface DrawItineraryOpts {
 	 * The synthetic map-centre start is never labelled.
 	 */
 	showStopNumbers?: boolean;
-	/**
-	 * Restrict the JMap router to a single path type for cross-floor
-	 * transitions. Accepted values are the path-type names JMap recognises,
-	 * e.g. `'Elevator'`, `'Stairs'`, `'Escalator'`. When omitted all
-	 * path types are used (the default enabled via `showAllPathTypes()`).
-	 * The previous path-type state is restored after `drawItinerary` returns.
-	 */
-	pathType?: 'Elevator' | 'Stairs' | 'Escalator' | (string & {});
 }
 
 export interface MinimapInstance {
@@ -515,8 +510,6 @@ export interface MinimapInstance {
 	clampWorldToFloor: (
 		world: { worldX: number; worldY: number; mapId: number },
 	) => { worldX: number; worldY: number; mapId: number };
-	/** Geometric centre of the floor in world coords; used as the off-map distance anchor. Null if size metadata unavailable. */
-	floorCenterWorld: () => { worldX: number; worldY: number; mapId: number } | null;
 	/** True when the projected world point falls inside the floor's world rectangle. False if bounds unavailable or on a different floor. */
 	isWorldInsideFloor: (world: { worldX: number; worldY: number; mapId: number } | null) => boolean;
 	/**
@@ -618,8 +611,7 @@ export interface MinimapInstance {
  * `projectWorldToViewport` (driven by `onViewChange`) to keep them aligned.
  */
 export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapInstance> {
-	const jibLog = (stage: string, msg: string, extra?: unknown): void =>
-		jibLogWith(opts.logger, stage, msg, extra);
+	const jibLog = makeJibLog(opts.logger);
 	const baseCfg = opts.cfg;
 	// Prefer the resource's own buildingExternalId (== venueId of its building) —
 	// a single campus can span multiple buildings/venues, so a single top-level
@@ -1105,23 +1097,28 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	// unknown waypoints, empty wayfind results, and drawWayfindingPath throws.
 	const ITINERARY_LABEL_LAYER = 'Itinerary-Stops';
 
-	// Returns the waypoint closest to the geometric centre of the current
-	// floor map. JMap stores width/height under a `_` private bag on the
-	// Map model (the public Map instance only exposes `_` and `uris` as
-	// enumerable keys), so `mapObj.size` is undefined — read from `_.size`
-	// instead, falling back to `_.width`/`_.height` if present.
-	function resolveMapCenterWaypoint(): unknown {
-		if (currentMapId == null) return null;
-		const mapObj = mapsColl?.getById?.(currentMapId) as
-			| { _?: { size?: { width?: number; height?: number }; width?: number; height?: number } }
-			| null
-			| undefined;
+	// Single owner of the floor-size read (JMapPrivateSizeBag: the size lives
+	// under the Map model's `_` private bag). Pure sync getter; null when the
+	// map or its size metadata is unavailable.
+	function floorSizeWorld(mapId: number): { width: number; height: number } | null {
+		const mapObj = mapsColl?.getById?.(mapId) as JMapPrivateSizeBag | null | undefined;
 		if (!mapObj) return null;
 		const priv = mapObj._ ?? {};
 		const w = priv.size?.width ?? priv.width;
 		const h = priv.size?.height ?? priv.height;
 		if (typeof w !== 'number' || typeof h !== 'number') return null;
-		const center: [number, number] = [w / 2, h / 2];
+		return { width: w, height: h };
+	}
+
+	// Returns the waypoint closest to the geometric centre of the current
+	// floor map (size read via floorSizeWorld).
+	function resolveMapCenterWaypoint(): unknown {
+		if (currentMapId == null) return null;
+		const mapObj = mapsColl?.getById?.(currentMapId);
+		if (!mapObj) return null;
+		const size = floorSizeWorld(currentMapId);
+		if (!size) return null;
+		const center: [number, number] = [size.width / 2, size.height / 2];
 		const av = control.activeVenue as { getClosestWaypointToCoordinatesOnMap?: (c: [number, number], m: unknown) => unknown } | undefined;
 		if (typeof av?.getClosestWaypointToCoordinatesOnMap !== 'function') return null;
 		try {
@@ -1136,9 +1133,7 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	// map. Used for a fixed "kiosk / you-are-here" start point when the host
 	// knows the exact location rather than wanting the geometric floor centre.
 	function resolveCoordinateWaypoint(coord: { mapId: number; x: number; y: number }): unknown {
-		const mapObj = mapsColl?.getById?.(coord.mapId) as
-			| { _?: { size?: { width?: number; height?: number }; width?: number; height?: number } }
-			| null | undefined;
+		const mapObj = mapsColl?.getById?.(coord.mapId);
 		if (!mapObj) {
 			jibLog('minimap', `resolveCoordinateWaypoint: mapId=${coord.mapId} not found`);
 			return null;
@@ -1173,16 +1168,11 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	function clampWorldToFloor(
 		world: { worldX: number; worldY: number; mapId: number },
 	): { worldX: number; worldY: number; mapId: number } {
-		const mapForClamp = mapsColl?.getById?.(world.mapId) as
-			| { _?: { size?: { width?: number; height?: number }; width?: number; height?: number } }
-			| null | undefined;
-		const priv = mapForClamp?._ ?? {};
-		const w = priv.size?.width ?? priv.width;
-		const h = priv.size?.height ?? priv.height;
-		if (typeof w !== 'number' || typeof h !== 'number') return world;
+		const size = floorSizeWorld(world.mapId);
+		if (!size) return world;
 		return {
-			worldX: Math.max(0, Math.min(w, world.worldX)),
-			worldY: Math.max(0, Math.min(h, world.worldY)),
+			worldX: Math.max(0, Math.min(size.width, world.worldX)),
+			worldY: Math.max(0, Math.min(size.height, world.worldY)),
 			mapId: world.mapId,
 		};
 	}
@@ -1433,22 +1423,6 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 
 		control.limitConcurrentPaths = false;
 		const style = buildPathStyle(drawOpts?.style);
-
-		// JMap's showPathType/hidePathType only affect icon rendering, not the
-		// routing graph — so toggling them never changed the path the user
-		// saw. To actually constrain routing to a single connector type we
-		// block every waypoint whose pathTypeId belongs to a DIFFERENT path
-		// type, force a re-route via wayfindBetweenWaypoints (which respects
-		// blocked waypoints), then unblock at the end.
-		// Walking-only waypoints (pathTypeId == null) are NEVER blocked —
-		// blocking them would cut off intra-floor edges and most routes.
-		// `opts.pathType` is accepted for API stability but currently a no-op:
-		// JMap v4's wayfindBetweenWaypoints has no per-pathType filter (only
-		// an `accessibility` threshold), and venue 2457's waypoints don't
-		// carry pathTypeId so blockWaypoint can't constrain the route. JMap
-		// picks the lowest-cost vertical transition on its own. See
-		// JIBENAV.md for the full rationale and what would re-enable this.
-		void drawOpts?.pathType;
 
 		let drawn = 0;
 		let missing = 0;
@@ -1703,34 +1677,13 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		return { longitude: pt[0], latitude: pt[1] };
 	}
 
-	// [w/2, h/2] in the floor's Local coordinate space.
-	function floorCenterWorld(): { worldX: number; worldY: number; mapId: number } | null {
-		if (currentMapId == null) return null;
-		const mapObj = mapsColl?.getById?.(currentMapId) as
-			| { _?: { size?: { width?: number; height?: number }; width?: number; height?: number } }
-			| null
-			| undefined;
-		if (!mapObj) return null;
-		const priv = mapObj._ ?? {};
-		const w = priv.size?.width ?? priv.width;
-		const h = priv.size?.height ?? priv.height;
-		if (typeof w !== 'number' || typeof h !== 'number') return null;
-		return { worldX: w / 2, worldY: h / 2, mapId: currentMapId };
-	}
-
 	// True when the point falls inside [0,width] × [0,height] of the current floor.
 	function isWorldInsideFloor(world: { worldX: number; worldY: number; mapId: number } | null): boolean {
 		if (!world || world.mapId !== currentMapId) return false;
-		const mapObj = mapsColl?.getById?.(currentMapId) as
-			| { _?: { size?: { width?: number; height?: number }; width?: number; height?: number } }
-			| null
-			| undefined;
-		if (!mapObj) return false;
-		const priv = mapObj._ ?? {};
-		const w = priv.size?.width ?? priv.width;
-		const h = priv.size?.height ?? priv.height;
-		if (typeof w !== 'number' || typeof h !== 'number') return false;
-		return world.worldX >= 0 && world.worldX <= w && world.worldY >= 0 && world.worldY <= h;
+		const size = floorSizeWorld(currentMapId);
+		if (!size) return false;
+		return world.worldX >= 0 && world.worldX <= size.width
+			&& world.worldY >= 0 && world.worldY <= size.height;
 	}
 
 	function resolveColleagueBookings(bookings: ColleagueBooking[]): ColleagueMarker[] {
@@ -1781,7 +1734,6 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		worldToLatLng,
 		nearestWaypointWorld,
 		clampWorldToFloor,
-		floorCenterWorld,
 		isWorldInsideFloor,
 		resolveColleagueBookings,
 		drawItinerary,

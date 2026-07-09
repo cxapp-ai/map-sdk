@@ -17,11 +17,24 @@
 // credentials against the same venue can never reuse each other's bearer —
 // the guarantee the original chat SDK provided by auto-clearing caches on
 // host destroy.
+//
+// The cache is capped at MAX_CACHE_ENTRIES (oldest evicted) so a long-lived
+// page that cycles configs — or recreates its getToken closure per mount —
+// can't grow it unboundedly; hosts should hoist getToken to a stable
+// reference to reuse the cache across remounts.
 
 import type { JibestreamConfig, MapLogger } from '../types.js';
 
-function jibLogWith(logger: MapLogger | undefined, stage: string, msg: string, extra?: unknown): void {
+export function jibLogWith(logger: MapLogger | undefined, stage: string, msg: string, extra?: unknown): void {
 	logger?.debug?.(`[jibestream:${stage}]`, msg, extra ?? '');
+}
+
+/**
+ * Curried per-callsite variant: `const jibLog = makeJibLog(logger)` gives the
+ * (stage, msg, extra) shape used throughout this module and the engine.
+ */
+export function makeJibLog(logger: MapLogger | undefined): (stage: string, msg: string, extra?: unknown) => void {
+	return (stage, msg, extra) => jibLogWith(logger, stage, msg, extra);
 }
 
 export interface Destination {
@@ -54,6 +67,14 @@ interface JibCacheEntry {
 // destinations instead of reusing the first one we loaded.
 const caches = new Map<string, JibCacheEntry>();
 
+// Cap on distinct config cache entries. Creating an entry beyond the cap
+// evicts the OLDEST one (Map preserves insertion order) after bumping its
+// generation — the same discipline as clearJibestreamCaches — so an in-flight
+// request that captured the evicted entry can't write a stale token into it.
+// Eviction only ever FORGETS a token (forcing a re-fetch); it never shares
+// one across keys, so the per-auth-identity isolation guarantee is unchanged.
+const MAX_CACHE_ENTRIES = 8;
+
 // Auth identity for the cache key. getToken callbacks are keyed by function
 // identity (a WeakMap-assigned id): a remount that passes a NEW callback —
 // e.g. a fresh closure minting for a different logged-in user — gets a fresh
@@ -83,6 +104,15 @@ function cacheFor(cfg: JibestreamConfig): JibCacheEntry {
 	const key = cacheKey(cfg);
 	let entry = caches.get(key);
 	if (!entry) {
+		while (caches.size >= MAX_CACHE_ENTRIES) {
+			const oldestKey = caches.keys().next().value as string;
+			const oldest = caches.get(oldestKey)!;
+			oldest.cacheGeneration++;
+			oldest.tokenCache = null;
+			oldest.tokenInflight = null;
+			oldest.venuePromise = null;
+			caches.delete(oldestKey);
+		}
 		entry = { tokenCache: null, tokenInflight: null, venuePromise: null, cacheGeneration: 0 };
 		caches.set(key, entry);
 	}
@@ -90,8 +120,7 @@ function cacheFor(cfg: JibestreamConfig): JibCacheEntry {
 }
 
 export function getToken(cfg: JibestreamConfig, logger?: MapLogger): Promise<string> {
-	const jibLog = (stage: string, msg: string, extra?: unknown): void =>
-		jibLogWith(logger, stage, msg, extra);
+	const jibLog = makeJibLog(logger);
 	const entry = cacheFor(cfg);
 	// 30s skew so requests issued near the boundary don't fail mid-flight.
 	if (entry.tokenCache && entry.tokenCache.expiresAt > Date.now() + 30_000) {
@@ -188,11 +217,6 @@ export function clearJibestreamCaches(): void {
 	caches.clear();
 }
 
-/** @internal Test helper — clears caches and resets the generation counters. */
-export function _resetJibestreamCachesForTests(): void {
-	caches.clear();
-}
-
 /**
  * Returns the cached token's `expiresAt` (epoch ms) for this config's cache
  * key, or null if no token is cached. Used by the JMap auth shim to schedule
@@ -205,8 +229,7 @@ export function peekTokenExpiry(cfg: JibestreamConfig): number | null {
 }
 
 export async function loadVenue(cfg: JibestreamConfig, logger?: MapLogger): Promise<VenueData> {
-	const jibLog = (stage: string, msg: string, extra?: unknown): void =>
-		jibLogWith(logger, stage, msg, extra);
+	const jibLog = makeJibLog(logger);
 	const entry = cacheFor(cfg);
 	const hit = entry.venuePromise;
 	if (hit) return hit;

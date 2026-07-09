@@ -27,3 +27,22 @@ These are binding for v1.
    The Jibestream engine sits behind a provider seam in the public API
    (`options.provider`) so a different map vendor can be added later without
    breaking the surface; v1 implements Jibestream only.
+
+## v2 considerations (from the post-port quality review)
+
+Not v1 changes — the v1 surface is frozen — but candidates for the next
+breaking rev:
+
+- **Hoist `venueBounds`/`venueCenter` out of the provider config.** They are
+  provider-agnostic presentation concerns (GPS away-chip / at-venue test),
+  not Jibestream connection data; a second provider would need them
+  duplicated.
+- **Fold `MapResource.capacity`/`reservationId` into the opaque
+  `bookingContext` pass-through.** Both are carried-for-host-use only (never
+  rendered), which is exactly what `bookingContext` is for.
+- **Drop or implement `ItineraryOptions.style`/`pathType`.** Both are
+  documented-inert in v1 (accepted, never threaded to the engine); an option
+  that can't do anything shouldn't survive a major rev.
+- **`GpsOptions.useNativeDot` leaks a Jibestream-specific concern** (JMap's
+  native `updateUserLocation` dot) through the provider seam; a provider-
+  neutral rendering hint or a provider-scoped options bag would fit better.

@@ -11,13 +11,14 @@
       "default": "./dist/map-sdk.js"
     },
     "./core": {
-      "types": "./dist/core.d.ts",
+      "types": "./dist/core/index.d.ts",
       "default": "./dist/core.js"
     },
     "./global": "./dist/map-sdk.iife.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "!dist/**/*.map"
   ],
   "scripts": {
     "build": "vite build && vite build --config vite.config.iife.ts",

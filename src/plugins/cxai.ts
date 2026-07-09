@@ -40,11 +40,11 @@ function getBridge(): CxaiCommandFn | null {
 	return null;
 }
 
-export function hasCxaiCommand(): boolean {
+function hasCxaiCommand(): boolean {
 	return getBridge() !== null;
 }
 
-export function cxaiCommand(cmd: string, args: Record<string, unknown>): boolean {
+function cxaiCommand(cmd: string, args: Record<string, unknown>): boolean {
 	const fn = getBridge();
 	if (!fn) return false;
 	try {
@@ -56,7 +56,7 @@ export function cxaiCommand(cmd: string, args: Record<string, unknown>): boolean
 	}
 }
 
-export interface NavigatePayload {
+interface NavigatePayload {
 	externalId: string | number;
 	buildingExternalId?: string | number | null;
 	floorId?: string | number | null;
@@ -68,7 +68,7 @@ export interface NavigatePayload {
  * floorId) and routes it into routeToPlacemark; web/android implement the
  * same URL contract on their end.
  */
-export function buildLiveMapDeeplink(payload: NavigatePayload): string | null {
+function buildLiveMapDeeplink(payload: NavigatePayload): string | null {
 	if (payload.externalId === undefined || payload.externalId === null || payload.externalId === '') {
 		return null;
 	}
@@ -83,7 +83,7 @@ export function buildLiveMapDeeplink(payload: NavigatePayload): string | null {
 	return `p_live_map?${params.toString()}`;
 }
 
-export function requestNavigation(payload: NavigatePayload): boolean {
+function requestNavigation(payload: NavigatePayload): boolean {
 	const url = buildLiveMapDeeplink(payload);
 	if (!url) return false;
 	return cxaiCommand('deeplink', { url });

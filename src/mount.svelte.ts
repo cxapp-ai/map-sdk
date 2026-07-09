@@ -26,17 +26,16 @@ import type {
 } from './types.js';
 
 /** Imperative methods exported by the view component. */
-interface IndoorMapExports {
-	confirmBooking(id: string | number): void;
-	focusResource(id: string | number): void;
-	setFloor(mapId: number): void;
-}
+type IndoorMapExports = Pick<IndoorMapHandle, 'confirmBooking' | 'focusResource' | 'setFloor'>;
 
 /**
  * Component event name → `options.on` callback key. The DOM event name is
  * `mapsdk:<key>` (types.ts: the callback key with "on" dropped, lowercased).
+ * The mapped type makes the table compile-checked exhaustive: adding a
+ * callback to MapEventCallbacks (or typo-ing a key here) is a type error.
  */
-const EVENT_CALLBACKS: Record<string, keyof MapEventCallbacks | undefined> = {
+type EventNameOf<K> = K extends `on${infer R}` ? Lowercase<R> : never;
+const EVENT_CALLBACKS: { [K in keyof MapEventCallbacks as EventNameOf<K>]: K } = {
 	ready: 'onReady',
 	resourceselect: 'onResourceSelect',
 	floorchange: 'onFloorChange',
@@ -116,34 +115,19 @@ export function mountIndoorMap(
 	wrapper.style.width = '100%';
 	wrapper.style.height = '100%';
 
-	// Host theme overrides as inline --map-* custom properties on the wrapper.
-	// DEFAULT_THEME is deliberately NOT applied inline: the component CSS keeps
-	// the original per-usage fallbacks (e.g. the teardrop pin's #0070F0 vs
-	// --map-primary's predominant #6366f1, the #fff card vs the rgba canvas
-	// backdrop under the same --map-surface-elevated token) — inlining the
-	// defaults would override those minority fallbacks and change today's
-	// look. See src/theme.ts. Keys without a leading "--" get the --map-
-	// prefix, mirroring the component's own themeStyle normalization.
-	let appliedThemeKeys: string[] = [];
-	function applyTheme(theme: Partial<MapTheme> | undefined): void {
-		for (const key of appliedThemeKeys) wrapper.style.removeProperty(key);
-		appliedThemeKeys = [];
-		if (!theme) return;
-		for (const [k, v] of Object.entries(theme)) {
-			if (v == null) continue;
-			const key = k.startsWith('--') ? k : `--map-${k}`;
-			wrapper.style.setProperty(key, v);
-			appliedThemeKeys.push(key);
-		}
-	}
-	applyTheme(options.theme);
+	// Theme lives on the component: the `theme` prop flows into the view's
+	// themeStyle, which applies the --map-* custom properties on the SDK root
+	// inside this wrapper (every --map-* consumer is inside the component).
 	container.appendChild(wrapper);
 
 	// ── Events: options.on callback + mapsdk:* CustomEvent, both per emit ──
 	let destroyed = false;
 	function emit(name: string, detail: unknown): void {
 		if (destroyed) return;
-		const key = EVENT_CALLBACKS[name];
+		// The component emits arbitrary strings; the exhaustive table narrows
+		// known names to their callback key (unknown names → no callback,
+		// CustomEvent still fires).
+		const key = (EVENT_CALLBACKS as Record<string, keyof MapEventCallbacks | undefined>)[name];
 		const cb = key ? (options.on?.[key] as ((detail: unknown) => void) | undefined) : undefined;
 		if (cb) {
 			// A throwing host callback must not break the map's internal flow
@@ -263,10 +247,7 @@ export function mountIndoorMap(
 				props.provider = { ...props.provider, ...patch.provider };
 			}
 			if (patch.strings) props.strings = { ...(props.strings ?? {}), ...patch.strings };
-			if (patch.theme) {
-				props.theme = { ...(props.theme ?? {}), ...patch.theme };
-				applyTheme(props.theme);
-			}
+			if (patch.theme) props.theme = { ...(props.theme ?? {}), ...patch.theme };
 		},
 		destroy(): void {
 			if (destroyed) return;
