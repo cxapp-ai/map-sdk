@@ -122,6 +122,12 @@
 		 */
 		itinerary?: Array<string | number>;
 		itineraryOptions?: ItineraryOptions;
+		/**
+		 * Auto-reroute (NavigationKit veer detection). Default true. When false,
+		 * the third-party CDN script is never loaded. Threaded to the engine's
+		 * createMinimap (seam S2).
+		 */
+		autoReroute?: boolean;
 		/** Live "you are here" overlay. false/omitted = off. */
 		gps?: boolean | GpsOptions;
 		/** Booking-from-card plugin. Without it, Book buttons hide. */
@@ -151,6 +157,7 @@
 		focusResourceId,
 		itinerary,
 		itineraryOptions,
+		autoReroute = true,
 		gps = false,
 		booking,
 		colleagues,
@@ -168,12 +175,36 @@
 	// Host theme overrides, applied as --map-* custom properties on the root.
 	// DEFAULT_THEME is deliberately NOT applied inline — every CSS usage keeps
 	// its original fallback (see src/theme.ts for the per-usage nuances).
-	const themeStyle = $derived(
+	//
+	// SECURITY: tokens are applied via `element.style.setProperty(name, value)`
+	// (see the $effect below) rather than string-concatenated into the inline
+	// `style` attribute. setProperty writes a SINGLE declaration and cannot be
+	// used to inject sibling declarations, so a tainted value (e.g. a
+	// white-label token from tenant CMS config) can't smuggle in extra CSS
+	// (full-viewport redress in fullscreen, `url()` exfil beacons). The key is
+	// normalized to `--map-*`; null/undefined values are skipped.
+	let rootEl: HTMLDivElement | undefined = $state();
+	const themeTokens = $derived(
 		Object.entries(theme ?? {})
 			.filter(([, v]) => v != null)
-			.map(([k, v]) => `${k.startsWith('--') ? k : `--map-${k}`}: ${v};`)
-			.join(' '),
+			.map(([k, v]) => [k.startsWith('--') ? k : `--map-${k}`, String(v)] as const),
 	);
+	// Track which token names we set so a token REMOVED from the theme (an
+	// update()) is cleared, not left stuck on the root from the prior apply.
+	let appliedThemeNames: string[] = [];
+	$effect(() => {
+		const tokens = themeTokens;
+		const el = rootEl;
+		if (!el) return;
+		const nextNames = tokens.map(([name]) => name);
+		for (const name of appliedThemeNames) {
+			if (!nextNames.includes(name)) el.style.removeProperty(name);
+		}
+		for (const [name, value] of tokens) {
+			el.style.setProperty(name, value);
+		}
+		appliedThemeNames = nextNames;
+	});
 
 	// Image loader: injected plugin, or plain passthrough (the path/URL is
 	// used directly as the <img src>).
@@ -246,9 +277,12 @@
 
 	// Tracking pin screen positions; recomputed every animation frame by the
 	// onViewChange callback so HTML pin overlays glue to the underlying map.
-	let positions = $state<Array<{ pin: PinInfo; x: number; y: number } | null>>([]);
+	// $state.raw: these arrays/objects are REPLACED wholesale every animation
+	// frame (projectPins/projectStart return fresh values); a deep proxy would
+	// pay per-element wrapping cost for nothing.
+	let positions = $state.raw<Array<{ pin: PinInfo; x: number; y: number } | null>>([]);
 	// Screen position of the "you are here" / kiosk dot; updated by onViewChange.
-	let startPos = $state<{ x: number; y: number } | null>(null);
+	let startPos = $state.raw<{ x: number; y: number } | null>(null);
 	// World coords of the resolved synthetic start (kiosk / map centre).
 	let syntheticStart = $state<{ worldX: number; worldY: number; mapId: number } | null>(null);
 	let userWorld = $state<{ worldX: number; worldY: number; mapId: number } | null>(null);
@@ -264,9 +298,15 @@
 	// when the cached fix belongs to THIS venue. A fix from a different venue
 	// (same SPA session) must not seed; we wait for a fresh fix instead.
 	// One-time read at mount: the seed is a snapshot, not a reactive binding.
+	// SECURITY: a gps:false mount must NOT seed from the shared cache — doing
+	// so would render the previous (gps:true) user's position on a mount whose
+	// caller declared location off (revoked consent / logged out on a shared
+	// device). Gate the seed on gpsEnabled so gps:false starts location-blind.
 	const seedVenueId = untrack(() => provider.venueId ?? null);
 	const seedFix =
-		sharedLastFix && sharedLastFix.venueId === seedVenueId ? sharedLastFix : null;
+		untrack(() => gpsEnabled) && sharedLastFix && sharedLastFix.venueId === seedVenueId
+			? sharedLastFix
+			: null;
 	const seedCoords = seedFix?.coords ?? null;
 	let lastUserCoords = $state<{ latitude: number; longitude: number } | null>(seedCoords);
 	// Latest fix that passed the accuracy gate. Drives everything that *places*
@@ -305,7 +345,8 @@
 	// re-hit the provider on every toggle-on.
 	let colleaguesFetched = $state(false);
 	let allColleagueMarkers = $state<ColleagueMarker[]>([]);
-	let colleaguePositions = $state<Array<{ marker: ColleagueMarker; x: number; y: number } | null>>([]);
+	// $state.raw: replaced wholesale each frame by projectColleagues.
+	let colleaguePositions = $state.raw<Array<{ marker: ColleagueMarker; x: number; y: number } | null>>([]);
 	// Profile photos load lazily through the injected image loader. Keep a
 	// local index of `loading | done` per colleague so the avatar renders the
 	// initials fallback instantly and swaps in the photo when it lands.
@@ -354,14 +395,47 @@
 	// The booked resource itself — kept for `bookingstatechange` emissions.
 	let bookingCardResource: MapResource | undefined = undefined;
 
+	// Effective focus target. Seeded from the mount-time `focusResourceId`
+	// prop, but the exported focusResource() writes it too, so a RUNTIME focus
+	// survives a rebuild: the mount effect's auto-select and initial-floor pick
+	// read `activeFocusId` (not the raw prop), which no longer snaps back to the
+	// mount-time value after every rebuild. A genuine prop change (host passes a
+	// new focusResourceId) still wins — synced below.
+	let activeFocusId = $state<string | number | undefined>(focusResourceId);
+	let lastFocusProp: string | number | undefined = focusResourceId;
+	$effect(() => {
+		// Only adopt the prop when the host actually changes it; an unrelated
+		// parent re-render (same value) must not clobber a runtime focusResource().
+		const incoming = focusResourceId;
+		if (incoming !== untrack(() => lastFocusProp)) {
+			lastFocusProp = incoming;
+			activeFocusId = incoming;
+		}
+	});
+
 	const sig = $derived(
 		resources.map(r => `${r.externalId ?? ''}|${r.name ?? ''}`).sort().join(',')
 		// venueId is included so a live venue switch (config swapped while mounted)
 		// rebuilds the instance: teardown nulls the projected world coords, and the
 		// new venue re-projects from scratch. lastUserCoords (the user's real lat/lng)
 		// is venue-agnostic and intentionally NOT reset — only the projection is stale.
-		+ '|cfg:' + JSON.stringify({ v: provider.venueId, fl: provider.floorLabels, k: provider.kioskCoordinate }),
+		//
+		// floorLabels is DELIBERATELY NOT in the signature: it only renames
+		// FloorInfo.mapName, so a late `update({provider:{floorLabels}})` is
+		// applied IN PLACE via `floorLabel()` in the floor strip rather than
+		// tearing down + re-initing the whole engine (a ≥1.3s rebuild for a
+		// pure rename). kioskCoordinate stays in the signature (it changes the
+		// synthetic route start / kiosk-first floor selection — a genuine rebuild).
+		+ '|cfg:' + JSON.stringify({ v: provider.venueId, k: provider.kioskCoordinate }),
 	);
+
+	// Reactive floor-label overlay for the floor strip. The engine bakes
+	// floorLabels into FloorInfo.mapName at build time; overlaying the CURRENT
+	// provider.floorLabels here lets a late update() rename tabs without a
+	// rebuild. Falls back to the engine-provided mapName when no override.
+	function floorLabel(f: FloorInfo): string {
+		return provider.floorLabels?.[f.mapId] ?? f.mapName;
+	}
 
 	// ── Mount / rebuild ────────────────────────────────────────────────────
 	// Single view (the popup's maximized experience): tick + 2×RAF
@@ -418,6 +492,12 @@
 					resources: snapshotResources,
 					cfg,
 					logger: untrack(() => logger),
+					// Seam S2: gate + defer NavigationKit (CDN) loading. Snapshot
+					// via untrack — a change shouldn't reactively rebuild here.
+					autoReroute: untrack(() => autoReroute),
+					// Seam S1: route async post-init engine failures (e.g.
+					// auth-refresh death) to the runtime error channel.
+					onEngineError: (e) => emit('error', { message: e.message, cause: e.cause }),
 					onViewChange: () => {
 						// untrack: fired synchronously inside the itinerary $effect;
 						// reactive reads here would cause effect_update_depth_exceeded.
@@ -439,8 +519,9 @@
 				unresolved = inst.state.unresolved;
 				if (selectedMapId == null) {
 					let initialFloor: number | null = null;
-					if (focusResourceId !== undefined) {
-						const target = String(focusResourceId);
+					const focusId = untrack(() => activeFocusId);
+					if (focusId !== undefined) {
+						const target = String(focusId);
 						for (const f of inst.state.floors) {
 							if (f.pins.some(p => String(p.resource.externalId ?? '') === target)) {
 								initialFloor = f.mapId;
@@ -480,15 +561,16 @@
 				// Re-runs after the settle window below to catch a focusResourceId
 				// whose pin wasn't yet in positions on the first attempt.
 				const autoSelect = () => {
-					if (focusResourceId === undefined) return;
+					const focusId = untrack(() => activeFocusId);
+					if (focusId === undefined) return;
 					// Select once (when nothing is selected yet). On the first run
 					// the carousel card refs are usually still unbound, so the
 					// scroll inside selectByExternalId no-ops — and the retry would
 					// otherwise bail because selectedPin is now set. So when already
 					// selected, just re-attempt the scroll: by the retry the refs
 					// are bound and the focused card finally centres.
-					if (!selectedPin) selectByExternalId(focusResourceId, { scroll: true });
-					else scrollCarouselToExternalId(focusResourceId);
+					if (!selectedPin) selectByExternalId(focusId, { scroll: true });
+					else scrollCarouselToExternalId(focusId);
 				};
 				autoSelect();
 
@@ -695,9 +777,11 @@
 		// Round to 10 m, but floor at 10 — the chip only shows when the user is
 		// OFF the venue, so it must never read "0m away" (a sub-5m fix would
 		// round to 0). 10 m is the smallest "away" we'll claim.
+		// The unit/word ("m away"/"km away") comes from MapStrings so hosts can
+		// localise it; `{d}` is the numeric distance placeholder.
 		const rounded = Math.max(10, Math.round(m / 10) * 10);
-		if (rounded < 1000) return `${rounded}m away`;
-		return `${(m / 1000).toFixed(1)}km away`;
+		if (rounded < 1000) return t.distanceAwayMeters.replace('{d}', String(rounded));
+		return t.distanceAwayKilometers.replace('{d}', (m / 1000).toFixed(1));
 	}
 
 	// ┌─ REVIEWED & INTENTIONAL — canonical list; do NOT re-flag/re-add ──────────
@@ -728,6 +812,10 @@
 		inst: MinimapInstance | null,
 		world: { worldX: number; worldY: number; mapId: number } | null,
 	): UserOverlay | null {
+		// SECURITY: gps:false must render no location at all (dot OR away chip),
+		// even if a stale coord lingered from a prior gps:true mount. Gate here
+		// so the you-are-here marker and the "m away" chip both go dark.
+		if (!untrack(() => gpsEnabled)) return null;
 		const coords = untrack(() => lastUserCoords);
 		if (!coords) return null;
 		const atVenue = isAtVenue(coords); // pure bbox test; null when no bounds
@@ -799,6 +887,8 @@
 	// mapId, so the dot/route-start target a hidden floor (SDK #21 class).
 	// Reliable fixes only — a noisy fix must not move the dot/route-start.
 	function reprojectUserWorld(inst: MinimapInstance): void {
+		// SECURITY: gps:false must not project or place the user at all.
+		if (!untrack(() => gpsEnabled)) return;
 		const coords = untrack(() => lastReliableCoords);
 		if (!coords) return;
 		const w = inst.updateUserPosition(coords);
@@ -1405,6 +1495,9 @@
 
 	/** Select + frame a resource's pin (and centre its carousel card). */
 	export function focusResource(id: string | number): void {
+		// Persist the runtime focus so a later rebuild re-asserts THIS resource,
+		// not the mount-time focusResourceId prop (minor arch fix).
+		activeFocusId = id;
 		selectByExternalId(id, { scroll: true });
 	}
 
@@ -1448,6 +1541,12 @@
 		allColleagueMarkers = [];
 		colleaguePositions = [];
 		avatarImages = {};
+		// SECURITY: null the module-shared fix cache so a LATER mount on a shared
+		// device (kiosk / logout→login SPA) can never seed from this user's last
+		// position. The current instance's live coords (lastUserCoords /
+		// lastReliableCoords) survive a rebuild; only the cross-instance seed is
+		// cleared here. A fresh fix re-populates it via handleGpsFix.
+		sharedLastFix = null;
 	}
 
 	// Shared handler for real geolocation fixes AND the mock fix. Drives
@@ -1538,6 +1637,11 @@
 				clearTimeout(settleTimer);
 				gpsSettled = true;
 				logger?.debug?.('[map-sdk] geolocation watch error', err.code, err.message);
+				// Widen the error channel to runtime: WebView shells need the
+				// denial/timeout signal (their native layer decides whether to
+				// prompt for location). cause.code is the GeolocationPositionError
+				// code (1=denied, 2=unavailable, 3=timeout).
+				emit('error', { message: err.message || 'geolocation watch error', cause: { code: err.code } });
 			},
 			{
 				enableHighAccuracy: true,
@@ -1697,12 +1801,26 @@
 			const synth = result?.syntheticStart ?? null;
 			syntheticStart = synth;
 			startPos = projectStart(inst, synth);
-		} catch {
+			// Surface a route that was requested (stops.length >= minStops above)
+			// but painted nothing — every leg missing / unroutable. Previously
+			// this failed silently. untrack: emit runs host callbacks and this is
+			// inside an effect. (drawn === 0 after the kiosk/centre fallback.)
+			if (result.drawn === 0) {
+				untrack(() => emit('error', {
+					message: 'itinerary draw produced no route',
+					cause: { stage: 'drawItinerary', drawn: result.drawn, missing: result.missing },
+				}));
+			}
+		} catch (e) {
 			// drawItinerary may internally call clearItinerary() before
 			// throwing, leaving the canvas cleared. Reset the overlay to
 			// avoid an orphaned "you are here" dot with no route.
 			syntheticStart = null;
 			startPos = null;
+			untrack(() => emit('error', {
+				message: e instanceof Error ? e.message : String(e),
+				cause: e,
+			}));
 		}
 	});
 
@@ -1733,13 +1851,13 @@
 	}
 </script>
 
-<div class="rm-modal-card" style={themeStyle}>
+<div bind:this={rootEl} class="rm-modal-card">
 	<div class="rm-modal-canvas-wrap">
 		<div bind:this={container} class="rm-canvas"></div>
 		{#if load === 'ready' && !switchingFloor}
 			{@render pinList(positions)}
 			{@render routeStartMarker(startPos)}
-			{@render youAreHereMarker(routeForcesNativeDot ? null : onMapPos(userOverlay))}
+			{@render youAreHereMarker(gpsEnabled && !routeForcesNativeDot ? onMapPos(userOverlay) : null)}
 			{#if colleaguesEnabled}
 				{@render colleagueAvatars(colleaguePositions)}
 			{/if}
@@ -1784,8 +1902,9 @@
 				<span class="rm-loading-text">{t.loadingMap}</span>
 			</div>
 		{/if}
-		<!-- Away chip rendered outside the ready-gate on purpose — REVIEWED #5. -->
-		{@render userOffMapIndicator(userOverlay)}
+		<!-- Away chip rendered outside the ready-gate on purpose — REVIEWED #5.
+		     gps:false hides it entirely (no location rendered without consent). -->
+		{@render userOffMapIndicator(gpsEnabled ? userOverlay : null)}
 		{#if load === 'ready' && resources.length > 0}
 			{@render resourceCarousel()}
 		{/if}
@@ -1799,8 +1918,8 @@
 	{#if pos}
 		<div
 			class="rm-here"
-			style="left: {pos.x}px; top: {pos.y}px;"
-			aria-label="You are here"
+			style="transform: translate3d({pos.x}px, {pos.y}px, 0) translate(-50%, -50%);"
+			aria-label={t.youAreHere}
 			role="img"
 		>
 			<span class="rm-here-halo"></span>
@@ -1813,8 +1932,8 @@
 	{#if pos}
 		<div
 			class="rm-start"
-			style="left: {pos.x}px; top: {pos.y}px;"
-			aria-label="Route start"
+			style="transform: translate3d({pos.x}px, {pos.y}px, 0) translate(-50%, -50%);"
+			aria-label={t.routeStart}
 			role="img"
 		></div>
 	{/if}
@@ -1823,7 +1942,7 @@
 {#snippet userOffMapIndicator(overlay: UserOverlay | null)}
 	<!-- Sole away cue, not route-gated — REVIEWED #2 on resolveUserOverlay. -->
 	{#if overlay?.kind === 'off' && overlay.label}
-		<div class="rm-user-faraway" role="img" aria-label={`You are ${overlay.label} from the venue`}>
+		<div class="rm-user-faraway" role="img" aria-label={t.userFarawayLabel.replace('{d}', overlay.label)}>
 			<span class="rm-user-faraway-label">{overlay.label}</span>
 		</div>
 	{/if}
@@ -1838,8 +1957,8 @@
 				class="rm-pin"
 				class:rm-pin-selected={!!selectedPin && item.pin === selectedPin}
 				class:rm-pin-dest={isDest}
-				style="left: {item.x}px; top: {item.y}px;"
-				aria-label={isDest ? `Destination ${item.pin.resource.name ?? ''}` : `Pin ${item.pin.resource.name ?? ''}`}
+				style="transform: translate3d({item.x}px, {item.y}px, 0) translate(-50%, -100%);"
+				aria-label={isDest ? `${t.destinationPrefix} ${item.pin.resource.name ?? ''}` : `${t.pinPrefix} ${item.pin.resource.name ?? ''}`}
 				onclick={() => clickPin(item.pin)}
 			>
 				<!-- Brand-blue teardrop location pin for every tenant (directory +
@@ -1863,7 +1982,7 @@
 			{@const name = colleagueName(item.marker.booking)}
 			<div
 				class="rm-avatar"
-				style="left: {item.x}px; top: {item.y}px;"
+				style="transform: translate3d({item.x}px, {item.y}px, 0) translate(-50%, -50%);"
 				title={name}
 				aria-label={name}
 			>
@@ -1889,7 +2008,7 @@
 				onclick={() => pickFloor(f.mapId)}
 				aria-pressed={f.mapId === selectedMapId}
 			>
-				{f.mapName}
+				{floorLabel(f)}
 			</button>
 		{/each}
 	</div>
@@ -2029,7 +2148,11 @@
 	/* "You are here" self-indicator overlay */
 	.rm-here {
 		position: absolute;
-		transform: translate(-50%, -50%);
+		/* left/top stay 0; per-frame position + centering are written to the
+		   inline `transform` (translate3d + translate(-50%,-50%)) so a pan/zoom
+		   frame never invalidates layout. */
+		left: 0;
+		top: 0;
 		width: 16px;
 		height: 16px;
 		pointer-events: none;
@@ -2060,7 +2183,9 @@
 	   (e.g. a GPS-origin route that fell back to the kiosk start). */
 	.rm-start {
 		position: absolute;
-		transform: translate(-50%, -50%);
+		/* left/top 0; position + centering via inline transform (layout-free). */
+		left: 0;
+		top: 0;
 		width: 14px;
 		height: 14px;
 		border-radius: 50%;
@@ -2108,7 +2233,9 @@
 	}
 	.rm-pin {
 		position: absolute;
-		transform: translate(-50%, -100%);
+		/* left/top 0; position + centering (tip at point) via inline transform. */
+		left: 0;
+		top: 0;
 		width: 36px;
 		height: 36px;
 		border: none;
@@ -2135,7 +2262,9 @@
 	   visually dominant marker for the currently-relevant resource. */
 	.rm-avatar {
 		position: absolute;
-		transform: translate(-50%, -50%);
+		/* left/top 0; position + centering via inline transform (layout-free). */
+		left: 0;
+		top: 0;
 		width: 32px;
 		height: 32px;
 		border-radius: 50%;
@@ -2330,6 +2459,9 @@
 		/* Clip pins/markers at the wrap edge so bottom-row pins don't bleed over
 		   the floor strip below it. */
 		overflow: hidden;
+		/* Isolate marker layout/style recalcs from the rest of the document:
+		   markers move via transform (layout-free) inside this container. */
+		contain: layout style;
 		background: var(--map-surface-elevated, rgba(0,0,0,0.04));
 	}
 	@keyframes rm-spin { to { transform: rotate(360deg); } }

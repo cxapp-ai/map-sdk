@@ -55,6 +55,14 @@ export interface LatLngBounds {
  * of it — there are no baked-in defaults, no env reads, no fallback venue.
  */
 export interface JibestreamConfig {
+	/**
+	 * Forward-compat provider discriminant. v1 implements Jibestream only, so
+	 * this is optional and defaults to 'jibestream' when absent. A second map
+	 * vendor is a v2 BREAKING change (the real abstraction seam is the internal
+	 * `MinimapInstance`, not this config); the discriminant is added now so the
+	 * v1 surface can be narrowed non-breakingly later. See docs/DECISIONS.md #5.
+	 */
+	kind?: 'jibestream';
 	/** JACS API origin, e.g. "https://api.jibestream.com". */
 	host: string;
 	customerId: number;
@@ -246,6 +254,15 @@ export interface MapEventCallbacks {
 	}) => void;
 	onNavigateRequested: (resource: MapResource) => void;
 	onFullscreenChange: (fullscreen: boolean) => void;
+	/**
+	 * Error channel. Fires on: mount failure (unsized/unmounted container,
+	 * venue-load rejection), geolocation denial/failure (`cause` carries the
+	 * `GeolocationPositionError`; read `(cause as GeolocationPositionError).code`
+	 * — 1=PERMISSION_DENIED, 2=POSITION_UNAVAILABLE, 3=TIMEOUT), background
+	 * auth-refresh failure (mid-session token expiry), and failed or empty
+	 * itinerary draws (no stops resolved on the map). `cause` is the underlying
+	 * error/event where one exists; `message` is always host-displayable.
+	 */
 	onError: (error: { message: string; cause?: unknown }) => void;
 }
 
@@ -270,6 +287,12 @@ export interface MapSdkOptions {
 	mode?: 'container' | 'fullscreen';
 	/** Live "you are here" overlay. false/omitted = off. */
 	gps?: boolean | GpsOptions;
+	/**
+	 * Load Jibestream NavigationKit for veer-detected auto-reroute during
+	 * active wayfinding. Loads a script from cdn.jibestream.com on first
+	 * itinerary draw. Set false to never contact the CDN. Default true.
+	 */
+	autoReroute?: boolean;
 	booking?: BookingPlugin;
 	colleagues?: ColleaguesPlugin;
 	images?: ImageLoaderPlugin;
@@ -281,7 +304,16 @@ export interface MapSdkOptions {
 }
 
 export interface IndoorMapHandle {
-	/** Replace the pinned resource set. */
+	/**
+	 * Replace the pinned resource set.
+	 *
+	 * REBUILD: this performs a FULL engine reload — the JMap controller is
+	 * destroyed and recreated, floor/pin/pan/booking/selection state resets,
+	 * `onReady` (and `mapsdk:ready`) re-fires, the venue/building data is
+	 * re-fetched, and there is a ~1.3s settle before the map is interactive
+	 * again. Not a cheap in-place diff. Call once with the final set rather
+	 * than repeatedly.
+	 */
 	setResources(resources: MapResource[]): void;
 	/** Draw (or clear, with null) a multi-stop route. */
 	setItinerary(ids: Array<string | number> | null, opts?: ItineraryOptions): void;
@@ -292,7 +324,20 @@ export interface IndoorMapHandle {
 	/** Flip a pending/booked state from an async host confirmation. */
 	confirmBooking(id: string | number): void;
 	setFullscreen(fullscreen: boolean): void;
-	/** Late-arriving config (e.g. floorLabels fetched after mount). */
+	/**
+	 * Late-arriving config (e.g. floorLabels fetched after mount).
+	 *
+	 * REBUILD SEMANTICS — not every patch is cheap:
+	 *  - `provider.floorLabels` applies IN PLACE (renames floor labels only; no
+	 *    reload).
+	 *  - `provider.kioskCoordinate` / `provider.venueBounds` / `venueCenter`
+	 *    and any resource change trigger a FULL engine reload: controller
+	 *    destroyed + recreated, state (floor/pin/pan/booking/selection) reset,
+	 *    `onReady` re-fires, venue data re-fetched, ~1.3s settle.
+	 *  - `strings` / `theme` apply in place.
+	 * Batch config changes into a single `update()` call to avoid stacking
+	 * reloads.
+	 */
 	update(patch: {
 		provider?: Partial<Pick<JibestreamConfig, 'floorLabels' | 'kioskCoordinate' | 'venueBounds' | 'venueCenter'>>;
 		strings?: Partial<MapStrings>;

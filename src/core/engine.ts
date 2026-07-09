@@ -100,23 +100,49 @@ type JmapModule = {
 const REFRESH_SKEW_MS = 30_000;
 const MIN_REFRESH_INTERVAL_MS = 60_000; // floor to avoid tight loops on tiny TTLs.
 
-async function buildHostTokenAuth(cfg: JibestreamConfig, logger?: MapLogger): Promise<{
+async function buildHostTokenAuth(
+	cfg: JibestreamConfig,
+	logger?: MapLogger,
+	onEngineError?: (err: { stage: string; message: string; cause?: unknown }) => void,
+): Promise<{
 	auth: unknown;
 	dispose: () => void;
+	start: () => void;
 }> {
 	const jibLog = makeJibLog(logger);
 	let currentToken = await getToken(cfg, logger);
 	let timer: ReturnType<typeof setTimeout> | null = null;
 	let disposed = false;
+	// The background-refresh timer is NOT armed until start() is called at the
+	// end of a successful createMinimap. Any throw during mount (after the shim
+	// is built but before the instance is returned) therefore leaves no armed
+	// timer to strand — nothing keeps calling the host's getToken() for a dead
+	// mount. refresh() may still run during init (JMap pulling a token); its
+	// scheduleNext() call no-ops until started.
+	let started = false;
 
 	const scheduleNext = (): void => {
 		if (timer) { clearTimeout(timer); timer = null; }
-		if (disposed) return;
+		if (disposed || !started) return;
 		const expiresAt = peekTokenExpiry(cfg);
 		if (!expiresAt) return; // No cache info — falls back to async-getter-driven refresh.
 		const wait = Math.max(MIN_REFRESH_INTERVAL_MS, expiresAt - Date.now() - REFRESH_SKEW_MS);
 		timer = setTimeout(() => {
-			void refresh().catch((e) => jibLog('auth', 'background refresh failed', e));
+			void refresh().catch((e) => {
+				// This is the ONLY silent-until-now post-init failure path: the
+				// mount succeeded, then a background bearer refresh threw (host
+				// getToken rejecting, mid-session 401). Keep the jibLog for
+				// parity, and surface it through onEngineError so the view can
+				// emit('error', …) — otherwise auth expiry dies silently.
+				jibLog('auth', 'background refresh failed', e);
+				try {
+					onEngineError?.({
+						stage: 'auth-refresh',
+						message: e instanceof Error ? e.message : String(e),
+						cause: e,
+					});
+				} catch { /* host callback must never break the shim */ }
+			});
 		}, wait);
 	};
 
@@ -146,7 +172,8 @@ async function buildHostTokenAuth(cfg: JibestreamConfig, logger?: MapLogger): Pr
 		}
 	};
 
-	scheduleNext();
+	// NB: the timer is intentionally NOT armed here — start() arms it once the
+	// mount has fully succeeded (see the `started` flag above).
 
 	// JCore reads `auth._[0]` and `auth._[1]` to feed `setCredentials({client_id, client_secret})`.
 	// With host-supplied tokens we don't have or want client credentials in the
@@ -172,7 +199,15 @@ async function buildHostTokenAuth(cfg: JibestreamConfig, logger?: MapLogger): Pr
 		if (timer) { clearTimeout(timer); timer = null; }
 	};
 
-	return { auth, dispose };
+	// Arm the background refresh. createMinimap calls this only after the mount
+	// has fully succeeded, so a failed mount never leaves a live timer running.
+	const start = (): void => {
+		if (disposed) return;
+		started = true;
+		scheduleNext();
+	};
+
+	return { auth, dispose, start };
 }
 
 interface JCore {
@@ -374,6 +409,20 @@ function ensureNavigationKitLoading(logger?: MapLogger): void {
 	const s = document.createElement('script');
 	s.src = NAVIGATIONKIT_SRC;
 	s.async = true;
+	// crossorigin is REQUIRED for SRI to be enforced (an opaque cross-origin
+	// response can't be hash-checked) and, on its own, keeps the script's
+	// error details out of other origins. Always set it.
+	s.crossOrigin = 'anonymous';
+	// TODO(SRI): pin an integrity hash for the immutable v1.2.0 artifact so a
+	// cdn.jibestream.com compromise can't inject arbitrary JS into every host
+	// (the script is handed the live JController whose JCore holds the auth
+	// object). Compute offline against the exact pinned URL:
+	//   curl -s https://cdn.jibestream.com/web/plugins/navigationkit/v1.2.0/navigationkit.js \
+	//     | openssl dgst -sha384 -binary | openssl base64 -A
+	// then: s.integrity = 'sha384-<hash>';
+	// Left unset here because the hash cannot be computed/verified offline in
+	// this environment; crossorigin is already applied so adding integrity
+	// later is a one-line change. See skipped[] in the fix report.
 	s.onerror = () => {
 		// Allow a future retry: clear the flag so a later mount re-injects.
 		navKitScriptInjected = false;
@@ -439,6 +488,23 @@ export interface CreateMinimapOpts {
 	logger?: MapLogger;
 	/** Fired whenever pan/zoom changes so the host can reposition pin overlays. */
 	onViewChange?: () => void;
+	/**
+	 * Invoked on async post-init engine failures that happen AFTER createMinimap
+	 * has resolved — currently a background token-refresh failure (the armed
+	 * auth-shim timer's getToken() throwing). Synchronous mount failures are
+	 * still surfaced by rejecting the createMinimap promise; this covers the
+	 * failures that would otherwise be logger-only. `stage` names the failure
+	 * class ('auth-refresh'); the view routes it to emit('error', …).
+	 */
+	onEngineError?: (err: { stage: string; message: string; cause?: unknown }) => void;
+	/**
+	 * Gate + defer the CDN-loaded NavigationKit (veer auto-reroute). When
+	 * false, the third-party script is never fetched (pin-only mounts stay
+	 * fully self-contained; veer auto-reroute silently no-ops). When true
+	 * (default), loading is DEFERRED to the first drawItinerary call, so a
+	 * pin-only mount that never draws a route also never hits the CDN.
+	 */
+	autoReroute?: boolean;
 }
 
 /** Public-surface alias (core/index.ts exports `MinimapOptions`). */
@@ -635,6 +701,18 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		throw new Error('venueId required: set cfg.venueId or resources[].buildingExternalId');
 	}
 	const cfg: JibestreamConfig = { ...baseCfg, venueId };
+	// Kick off the jmap.js chunk download concurrently with the venue fetch.
+	// The two are fully independent (loadVenue is a token POST + /full fetch;
+	// loadJmap is a module-cached dynamic import), so starting the ~307KB-gzip
+	// chunk transfer now instead of after loadVenue resolves removes a serial
+	// network round-trip from cold start. Module-cached → race-safe; awaited at
+	// the original load site below, so no observable ordering change.
+	const jmapPromise = loadJmap();
+	// Guard against an unhandled-rejection warning if loadVenue throws first and
+	// we return before awaiting jmapPromise below. The real error still
+	// surfaces at the `await jmapPromise` site (loadJmap is module-cached, so
+	// this attaches a second handler, not a second import).
+	jmapPromise.catch(() => {});
 	const venue: VenueData = await loadVenue(cfg, opts.logger);
 
 	// Resolve resources → group by floor.
@@ -665,7 +743,7 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	}
 
 	// Create our own JMap controller mounted in the supplied container.
-	const jmap = await loadJmap();
+	const jmap = await jmapPromise;
 
 	// JMap requires the container to have a DOM id selector. Generate one.
 	let containerId = opts.container.id;
@@ -683,10 +761,12 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	// leaks. Without cfg.auth.getToken, JMap drives its own client_credentials.
 	let jmapAuth: unknown;
 	let disposeAuthShim: (() => void) | null = null;
+	let startAuthRefresh: (() => void) | null = null;
 	if ('getToken' in cfg.auth) {
-		const built = await buildHostTokenAuth(cfg, opts.logger);
+		const built = await buildHostTokenAuth(cfg, opts.logger, opts.onEngineError);
 		jmapAuth = built.auth;
 		disposeAuthShim = built.dispose;
+		startAuthRefresh = built.start;
 	} else {
 		jmapAuth = new jmap.core.Auth(cfg.auth.clientId ?? '', cfg.auth.clientSecret ?? '');
 	}
@@ -718,24 +798,37 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 			: undefined;
 		coreOpts.request = makeJacsRequest(cfg.mapProfileId, getBearer);
 	}
-	const core = new jmap.core.JCore(coreOpts);
+	// The auth-shim's background refresh timer is NOT armed yet — startAuthRefresh()
+	// arms it only after a fully successful mount (just before the return below), so
+	// a throw anywhere between here and that return strands no timer. The try/catch
+	// guards below additionally tear down control / RAF / ResizeObserver — resources
+	// that DO get created mid-mount — and best-effort dispose the shim.
+	let core: JCore;
+	let activeVenue: unknown;
+	let control: JController;
+	try {
+		core = new jmap.core.JCore(coreOpts);
 
-	const activeVenue: unknown = await new Promise((resolve, reject) => {
-		core.populateVenueWithDefaultBuilding(cfg.venueId, (err, av) => {
-			if (err) reject(err);
-			else resolve(av);
+		activeVenue = await new Promise((resolve, reject) => {
+			core.populateVenueWithDefaultBuilding(cfg.venueId, (err, av) => {
+				if (err) reject(err);
+				else resolve(av);
+			});
 		});
-	});
 
-	const control = new jmap.JController({
-		engine: 'canvas',
-		container: `#${containerId}`,
-		activeVenue,
-	});
+		control = new jmap.JController({
+			engine: 'canvas',
+			container: `#${containerId}`,
+			activeVenue,
+		});
+	} catch (e) {
+		try { disposeAuthShim?.(); } catch { /* best-effort teardown */ }
+		throw e;
+	}
 
 	if (typeof control.showDefaultMap === 'function') {
 		try { control.showDefaultMap(); } catch (e) {
-			console.warn('[minimap] showDefaultMap threw', e);
+			jibLog('minimap', 'showDefaultMap threw', e);
 		}
 	}
 
@@ -761,12 +854,26 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	// venue; if unentitled, hasUserVeeredOffRoute may no-op/throw (verify on-venue).
 	// No re-anchor fallback by request — auto-reroute relies solely on this.
 	//
+	// SECURITY / SELF-CONTAINEDNESS: the CDN fetch is now GATED and DEFERRED.
+	//   - autoReroute === false  → the third-party script is NEVER fetched.
+	//   - autoReroute !== false   → loading is deferred to the FIRST drawItinerary
+	//     (its only consumer), so pin-only mounts that never draw a route stay
+	//     fully self-contained and never hit cdn.jibestream.com.
+	// ensureNavigationKitLoading() is therefore NO LONGER called eagerly here.
+	//
 	// Constructed LAZILY on first use (getNavigationKit), re-checking the global
 	// each call — so a script that loads after a slow CDN is still picked up
 	// rather than being lost to a one-shot timeout that already resolved null.
-	ensureNavigationKitLoading(opts.logger);
+	const autoReroute = opts.autoReroute ?? true;
 	let navigationKit: NavigationKitInstance | null = null;
+	// Kick off the (idempotent) CDN injection. Called lazily from drawItinerary,
+	// never at mount. No-op when auto-reroute is disabled.
+	function ensureNavigationKit(): void {
+		if (!autoReroute) return;
+		ensureNavigationKitLoading(opts.logger);
+	}
 	function getNavigationKit(): NavigationKitInstance | null {
+		if (!autoReroute) return null;
 		if (navigationKit) return navigationKit;
 		const Ctor = getNavigationKitCtor();
 		if (!Ctor) { ensureNavigationKitLoading(opts.logger); return null; }
@@ -1321,6 +1428,13 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		missing: number;
 		syntheticStart?: { worldX: number; worldY: number; mapId: number };
 	} {
+		// Deferred, idempotent CDN load: the first time a route is drawn is the
+		// earliest point veer auto-reroute could ever be needed. Pin-only mounts
+		// never reach here, so they never fetch the third-party script. No-op
+		// when autoReroute === false. The existing "loading in progress" guard
+		// (navKitScriptInjected) makes repeat calls cheap.
+		ensureNavigationKit();
+
 		clearItinerary();
 
 		// New destination set → allow one fresh framing; same set (re-anchor) keeps it.
@@ -1604,7 +1718,11 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 				width: 10,
 				pulseVisible: true,
 			});
-			jibLog('minimap', `setNativeUserLocation: drew at [${world.worldX.toFixed(1)}, ${world.worldY.toFixed(1)}] map ${world.mapId}`);
+			// Do NOT log the world x/y or mapId: on every reliable fix this
+			// would write a per-tick indoor movement trail to MapLogger.debug,
+			// which a host may forward to telemetry (Sentry breadcrumbs, log
+			// aggregation) and persist. Log presence only, never position.
+			jibLog('minimap', 'setNativeUserLocation: native user location updated');
 			return true;
 		} catch (e) {
 			jibLog('minimap', 'updateUserLocation threw', e);
@@ -1714,17 +1832,32 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		return out;
 	}
 
-	// Show the dominant floor + start the projection RAF.
-	if (dominantMapId != null) setFloor(dominantMapId, false);
-	rafHandle = requestAnimationFrame(tick);
+	// Continue guarding the armed auth-shim timer through to the successful
+	// return: any throw during initial floor framing / settle must still
+	// dispose the shim before propagating.
+	try {
+		// Show the dominant floor + start the projection RAF.
+		if (dominantMapId != null) setFloor(dominantMapId, false);
+		rafHandle = requestAnimationFrame(tick);
 
-	// Wait for the renderer to settle, then frame to the pins before we
-	// return. Caller's loading → ready transition then reveals the already-
-	// zoomed view instead of the default extent + a delayed pan/zoom.
-	if (dominantMapId != null) {
-		await new Promise<void>(resolve => setTimeout(resolve, MAP_SETTLE_MS));
-		frameCurrentFloor();
+		// Wait for the renderer to settle, then frame to the pins before we
+		// return. Caller's loading → ready transition then reveals the already-
+		// zoomed view instead of the default extent + a delayed pan/zoom.
+		if (dominantMapId != null) {
+			await new Promise<void>(resolve => setTimeout(resolve, MAP_SETTLE_MS));
+			frameCurrentFloor();
+		}
+	} catch (e) {
+		if (rafHandle != null) cancelAnimationFrame(rafHandle);
+		resizeObserver?.disconnect();
+		try { control.destroy?.(); } catch { /* best-effort teardown */ }
+		try { disposeAuthShim?.(); } catch { /* best-effort teardown */ }
+		throw e;
 	}
+
+	// Mount fully succeeded — now arm the background token refresh (deferred to
+	// here so a failed mount never leaves a live timer).
+	startAuthRefresh?.();
 
 	return {
 		state: { floors, dominantMapId, unresolved },

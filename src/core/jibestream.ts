@@ -43,6 +43,16 @@ export interface Destination {
 	locations: Array<{ mapId: number; waypointIds: number[] }>;
 }
 
+// Shape of a raw JACS `/full` destination item as it arrives on the wire. Only
+// the fields the SDK consumes are typed; the wire object carries more (polygons,
+// styling, …) which the ingest projection deliberately drops. `?? []` guards
+// keep the projection resilient to items missing `locations`/`waypointIds`.
+interface RawDestination {
+	id: number;
+	name: string;
+	locations?: Array<{ mapId: number; waypointIds?: number[] }>;
+}
+
 export interface VenueData {
 	id: number;
 	name: string;
@@ -93,7 +103,24 @@ function authKey(auth: JibestreamConfig['auth'] | undefined): string {
 		}
 		return `fn#${id}`;
 	}
-	return `cc:${auth.clientId}`;
+	// Fold a cheap, non-reversible discriminant of the secret into the key so a
+	// rotated/wrong clientSecret (same clientId) can't be masked by a token
+	// cached under the OLD secret. This is a collision-avoidance discriminant,
+	// NOT a security primitive: it is never logged and never reversible to the
+	// secret (length + a simple additive char-sum, folded to 32 bits).
+	return `cc:${auth.clientId}:${secretDiscriminant(auth.clientSecret)}`;
+}
+
+// Non-reversible discriminant of the client secret for cache keying only.
+// Deliberately NOT a cryptographic hash and NEVER logged — it only needs to
+// differ when the secret changes so a stale token isn't reused after rotation.
+function secretDiscriminant(secret: string | undefined): string {
+	if (!secret) return '0.0';
+	let sum = 0;
+	for (let i = 0; i < secret.length; i++) {
+		sum = (sum * 31 + secret.charCodeAt(i)) >>> 0;
+	}
+	return `${secret.length}.${sum.toString(36)}`;
 }
 
 function cacheKey(cfg: JibestreamConfig): string {
@@ -250,13 +277,30 @@ export async function loadVenue(cfg: JibestreamConfig, logger?: MapLogger): Prom
 		});
 		if (!res.ok) throw new Error(`Jibestream venue fetch failed: ${res.status}`);
 		const raw = await res.json();
-		const destinations: Destination[] = raw.destinations?.items ?? [];
+		// Project the raw JACS destination items to the fields the SDK actually
+		// consumes ({id, name, locations:{mapId, waypointIds}}). The raw items
+		// carry large unprojected sub-objects (polygons, styling, etc.) that are
+		// never read — retaining them held ×MAX_CACHE_ENTRIES copies alive.
+		// This is a PURE field-narrowing: the single projected object is shared
+		// by identity across `destinations`, `byWaypointId`, and `byName` exactly
+		// as the raw object was, and every consumer only ever touches id/name/
+		// locations (verified: engine reads dest.locations[0].mapId; resolve*
+		// use id/name; the meta.waypointIds path reads a JMap unit, not this).
+		const rawItems: RawDestination[] = raw.destinations?.items ?? [];
+		const destinations: Destination[] = rawItems.map((d) => ({
+			id: d.id,
+			name: d.name,
+			locations: (d.locations ?? []).map((loc) => ({
+				mapId: loc.mapId,
+				waypointIds: loc.waypointIds ?? [],
+			})),
+		}));
 		const byWaypointId = new Map<number, Destination>();
 		const byName = new Map<string, Destination>();
 		for (const d of destinations) {
 			byName.set(d.name.toLowerCase(), d);
-			for (const loc of d.locations ?? []) {
-				for (const wp of loc.waypointIds ?? []) byWaypointId.set(wp, d);
+			for (const loc of d.locations) {
+				for (const wp of loc.waypointIds) byWaypointId.set(wp, d);
 			}
 		}
 		jibLog('venue', `loaded "${raw.name}" — ${destinations.length} destinations`);
@@ -267,7 +311,7 @@ export async function loadVenue(cfg: JibestreamConfig, logger?: MapLogger): Prom
 		return await thisVenueCache;
 	} catch (e) {
 		if (entry.venuePromise === thisVenueCache) entry.venuePromise = null;
-		console.error('[jibestream:venue] load failed', e);
+		jibLog('venue', 'load failed', e);
 		throw e;
 	}
 }

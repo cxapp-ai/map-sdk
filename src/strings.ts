@@ -36,4 +36,12 @@ export const DEFAULT_STRINGS: MapStrings = {
 	errorNoResponse: 'No response — try again.',
 	// common.*
 	tryAgain: 'Try again',
+	// overlay / a11y — exact keys read by src/ui/IndoorMap.svelte:
+	youAreHere: 'You are here', // aria-label for the GPS "you are here" dot
+	routeStart: 'Route start', // aria-label for the wayfinding start marker
+	pinPrefix: 'Pin', // aria-label prefix: `${pinPrefix} <name>`
+	destinationPrefix: 'Destination', // aria-label prefix: `${destinationPrefix} <name>`
+	distanceAwayMeters: '{d}m away', // off-venue chip; {d} = integer metres
+	distanceAwayKilometers: '{d}km away', // off-venue chip; {d} = one-decimal km
+	userFarawayLabel: 'You are {d} from the venue', // {d} = formatted distance label
 };

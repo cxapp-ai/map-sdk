@@ -24,9 +24,18 @@ These are binding for v1.
 5. **Backend-agnostic, host supplies all map info.** No wxsuperapp/CX-backend
    calls in the SDK: no meetingId→venue resolution, no colleague endpoint, no
    auth-gated image fetching — all injected as plugins or supplied as config.
-   The Jibestream engine sits behind a provider seam in the public API
-   (`options.provider`) so a different map vendor can be added later without
-   breaking the surface; v1 implements Jibestream only.
+
+   **Provider seam — honest scope (revised post-review).** `options.provider`
+   is NOT a working v1 abstraction seam: Jibestream numeric mapIds are baked
+   into `setFloor`/`onFloorChange`/`floorLabels`, `update()` is typed as a
+   `Pick<JibestreamConfig, …>`, and `/core` exports provider-concrete
+   functions. Adding a second map vendor is therefore a **v2 BREAKING rev**,
+   not a drop-in. The real abstraction seam is the internal `MinimapInstance`
+   interface (`src/core/engine.ts`) — that is where a second provider gets
+   formalized in v2, not at `options.provider`. What v1 does now: a
+   non-breaking, forward-compat `kind?: 'jibestream'` discriminant on
+   `JibestreamConfig` so the surface can be narrowed later without a further
+   break. v1 implements Jibestream only.
 
 ## v2 considerations (from the post-port quality review)
 

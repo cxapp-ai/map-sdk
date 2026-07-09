@@ -15,20 +15,23 @@ npm run dev        # vite --config demo/vite.config.ts
 ## Credentials
 
 The demo reads Jibestream credentials from **`demo/.env.local`** (gitignored
-via `*.local` — NEVER commit secrets):
+via `*.local` — NEVER commit secrets). Copy the template and fill it from the
+team secrets store:
 
 ```sh
-# demo/.env.local
-VITE_JIBESTREAM_HOST=https://api.jibestream.com   # optional, this is the default
-VITE_JIBESTREAM_CUSTOMER_ID=...
-VITE_JIBESTREAM_VENUE_ID=...
-VITE_JIBESTREAM_CLIENT_ID=...
-VITE_JIBESTREAM_CLIENT_SECRET=...
-VITE_JIBESTREAM_MAP_PROFILE_ID=...                # only if your service account needs it
+cp demo/.env.example demo/.env.local
+# then fill demo/.env.local with values from the team secrets store
 ```
 
-Working demo-venue values live in the sibling repo's `nova-chat-sdk/app/.env.local`
-(same variable names) — copy them locally from there.
+See `demo/.env.example` for the full list of variables. Pull the actual
+demo-venue values from the team secrets store (password manager / vault) — do
+not copy secrets between checkouts or paste them into tracked files.
+
+> **Secret rotation required.** The Jibestream client secret previously used
+> for this demo (the one paired with client id `838c9279…`) is BURNED: its
+> pair is exposed in `nova-chat-sdk` git history. It MUST be rotated
+> out-of-band in the Jibestream console (owner: Waleed) and only the rotated
+> secret placed in the secrets store. Do not reintroduce the old value.
 
 The demo uses the dev-only `clientId`/`clientSecret` auth mode, which ships the
 secret to the browser. Production hosts must use `auth: { getToken }` with

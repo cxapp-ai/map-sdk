@@ -215,6 +215,9 @@ try {
 	mountMap();
 } catch (e) {
 	const msg = e instanceof Error ? e.message : String(e);
-	mapEl.innerHTML = `<div style="padding:24px;font-size:14px;color:#b91c1c;">${msg}</div>`;
+	const errDiv = document.createElement('div');
+	errDiv.style.cssText = 'padding:24px;font-size:14px;color:#b91c1c;';
+	errDiv.textContent = msg;
+	mapEl.replaceChildren(errDiv);
 	log(`[host] mount failed: ${msg}`);
 }

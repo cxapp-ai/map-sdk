@@ -191,6 +191,11 @@ export function mountIndoorMap(
 		focusResourceId: options.focusResourceId,
 		itinerary: options.itinerary,
 		itineraryOptions: options.itineraryOptions,
+		// Seam S2: gate + defer NavigationKit (CDN) loading in the engine.
+		// Default true (auto-reroute on). Public MapSdkOptions.autoReroute is
+		// added by the packaging agent; read it off options here (TS reconciles
+		// once the type lands).
+		autoReroute: options.autoReroute ?? true,
 		gps: options.gps ?? false,
 		booking: options.booking,
 		colleagues: options.colleagues,
@@ -240,10 +245,11 @@ export function mountIndoorMap(
 		}): void {
 			if (destroyed || !patch) return;
 			if (patch.provider) {
-				// floorLabels/kioskCoordinate participate in the component's
-				// rebuild signature — a late floorLabels fetch re-renders the
-				// floor strip (REQUIREMENTS §3 coupling #1: preserve config
-				// reactivity). venueBounds/venueCenter update in place.
+				// floorLabels applies IN PLACE (the floor strip re-renders its
+				// tab labels reactively — no engine rebuild). kioskCoordinate
+				// participates in the component's rebuild signature (it changes
+				// the synthetic route start / kiosk-first floor pick).
+				// venueBounds/venueCenter update in place.
 				props.provider = { ...props.provider, ...patch.provider };
 			}
 			if (patch.strings) props.strings = { ...(props.strings ?? {}), ...patch.strings };
