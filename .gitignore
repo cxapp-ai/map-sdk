@@ -1,4 +1,24 @@
+# Dependencies
 node_modules/
+
+# Build output — generated at install time via the `prepare` script, never committed
 dist/
+
+# Secrets / local env — NEVER commit these. .env.example (placeholders) is tracked.
+.env
+.env.*
+!.env.example
 *.local
+
+# Logs & caches
+*.log
+npm-debug.log*
+.npm/
+.vite/
+*.tsbuildinfo
+
+# Editor / OS
 .DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
