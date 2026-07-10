@@ -2298,7 +2298,10 @@
 	.rm-colleagues-toggle {
 		position: absolute;
 		left: 16px;
-		bottom: 16px;
+		/* Top-left, not bottom-left: the resource carousel spans the full width
+		   along the bottom (z-index 30) and covers a bottom-left toggle in
+		   multi-card mode. Top-left is clear (unresolved badge is top-right). */
+		top: 16px;
 		display: inline-flex;
 		align-items: center;
 		gap: 6px;
@@ -2347,7 +2350,8 @@
 	.rm-colleagues-status {
 		position: absolute;
 		left: 16px;
-		bottom: 60px;
+		/* Sits just below the toggle (now top-left). */
+		top: 60px;
 		padding: 6px 12px;
 		border-radius: 999px;
 		background: rgba(15, 23, 42, 0.78);

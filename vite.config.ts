@@ -87,6 +87,17 @@ export default defineConfig({
       formats: ['es'],
       fileName: (_format, entryName) => (entryName === 'index' ? 'map-sdk.js' : `${entryName}.js`),
     },
+    // jmap.js is a webpack-UMD bundle of PixiJS that reassigns its own module
+    // exports at runtime. Bundling it into this ESM output makes Rollup expose
+    // those exports as getter-only live bindings, so on the 2nd map mount Pixi
+    // throws "Cannot set property glCore … which has only a getter". Keep it
+    // EXTERNAL here: the ESM entry emits `import('jmap.js')` and the consumer's
+    // bundler transforms Pixi once (the proven-working path). jmap.js is a
+    // runtime `dependency` so it installs automatically. The IIFE build
+    // (vite.config.iife.ts) still inlines it for no-bundler WebView hosts.
+    rollupOptions: {
+      external: ['jmap.js'],
+    },
     sourcemap: true,
   },
 });

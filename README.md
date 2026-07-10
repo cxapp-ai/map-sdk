@@ -389,3 +389,13 @@ npm run dev      # demo app (demo/, needs VITE_JIBESTREAM_* creds — never comm
 `jmap.js` is pinned **exactly** (4.14.1): the engine relies on undocumented
 JMap internals; treat any bump as a breaking change and re-run the demo
 smoke test against a live venue.
+
+**jmap.js is a runtime `dependency`, not bundled into the ESM output.** It is a
+webpack-UMD bundle of PixiJS that reassigns its own module exports at runtime;
+bundling it into the ESM entry makes those exports getter-only and Pixi throws
+`Cannot set property glCore … which has only a getter` on the second map mount.
+So the ESM entries (`dist/map-sdk.js`, `dist/core.js`) emit `import('jmap.js')`
+and your bundler transforms Pixi once (installed automatically as a dependency).
+The IIFE global build **does** inline jmap.js — a no-bundler WebView host has
+nothing to resolve a bare import against, and the IIFE format doesn't hit the
+getter-only interop issue.
