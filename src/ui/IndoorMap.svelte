@@ -130,6 +130,13 @@
 		autoReroute?: boolean;
 		/** Live "you are here" overlay. false/omitted = off. */
 		gps?: boolean | GpsOptions;
+		/**
+		 * Whether carousel cards offer a "Book" action and a resource
+		 * thumbnail. Default true (desks/rooms). Set false for location-only
+		 * surfaces (amenity/wayfinding POIs — restrooms, coffee, exits): no
+		 * Book button, no thumbnail, card text uses the full width.
+		 */
+		bookable?: boolean;
 		/** Booking-from-card plugin. Without it, Book buttons hide. */
 		booking?: BookingPlugin;
 		/** Colleague-avatar overlay plugin. Without it, the toggle hides. */
@@ -159,6 +166,7 @@
 		itineraryOptions,
 		autoReroute = true,
 		gps = false,
+		bookable = true,
 		booking,
 		colleagues,
 		images,
@@ -1396,7 +1404,9 @@
 		// Mall/directory tenants are destinations, not reservable spaces —
 		// they carry suite/address, not a booking flow. Keep suppressing Book
 		// for them so a directory result never shows a bookable button.
-		return !!booking && r.type !== 'tenant' && !r.alreadyBooked && !!r.name;
+		// `bookable` (prop, default true) is the per-mount switch for
+		// location-only surfaces (amenity POIs) — no Book even with a plugin.
+		return bookable && !!booking && r.type !== 'tenant' && !r.alreadyBooked && !!r.name;
 	}
 
 	// Book directly from a carousel card. Bypasses `selectedPin` because the
@@ -2044,7 +2054,7 @@
 				: (bookingCardName != null && (r.name ?? '') === bookingCardName)}
 			<div
 				class="rm-carousel-card"
-				class:rm-carousel-card-active={isSelected}
+				class:rm-carousel-card-active={isSelected} class:rm-carousel-card-nothumb={!bookable}
 				bind:this={
 					() => cardRefs[i],
 					(el) => {
@@ -2062,13 +2072,15 @@
 					}
 				}}
 			>
-				<div class="rm-carousel-thumb">
-					{#if thumb?.url}
-						<img src={thumb.url} alt={r.name ?? ''} loading="lazy" />
-					{:else}
-						<div class="rm-carousel-thumb-skel"></div>
-					{/if}
-				</div>
+				{#if bookable}
+					<div class="rm-carousel-thumb">
+						{#if thumb?.url}
+							<img src={thumb.url} alt={r.name ?? ''} loading="lazy" />
+						{:else}
+							<div class="rm-carousel-thumb-skel"></div>
+						{/if}
+					</div>
+				{/if}
 				<div class="rm-carousel-info">
 					<div class="rm-carousel-head">
 						<div class="rm-carousel-name">{r.name ?? '—'}</div>
@@ -2532,6 +2544,8 @@
 		display: grid;
 		grid-template-columns: 72px 1fr;
 		align-items: center;
+		/* (non-bookable cards drop the 72px thumbnail column — see
+		   .rm-carousel-card-nothumb below) */
 		gap: 12px;
 		padding: 12px;
 		background: var(--map-surface-elevated, #fff);
@@ -2545,6 +2559,10 @@
 		-webkit-user-select: none;
 		-webkit-tap-highlight-color: transparent;
 	}
+	/* No thumbnail (non-bookable POIs): drop the reserved 72px image column so
+	   the info — and the name — uses the full card width instead of being
+	   crammed into the empty thumbnail cell. */
+	.rm-carousel-card-nothumb { grid-template-columns: 1fr; }
 	.rm-carousel-single .rm-carousel-card {
 		width: min(90vw, 480px);
 		cursor: default;
