@@ -788,16 +788,23 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 			pushItem(r.mapId, 'coords', null, r);
 			continue;
 		}
+		// Host-explicit placement wins over the destination index: a resource
+		// carrying BOTH its floor (mapId) and a waypoint externalId has already
+		// chosen WHICH instance of the POI to show (bond's map agent selects
+		// per-floor instances for counts/nearest/routes, and amenities aren't
+		// in the destination index at all). Resolving through the destination
+		// index here would re-group on the destination's FIRST location and
+		// pin a multi-floor POI on the wrong level. Resources without a mapId
+		// (booking flows) still resolve through the index below.
+		if (r.externalId != null && r.mapId != null) {
+			pushItem(r.mapId, 'waypoint', null, r);
+			continue;
+		}
 		const dest = resolveDestination(venue, r);
 		if (dest) {
 			const mapId = dest.locations?.[0]?.mapId;
 			if (mapId) { pushItem(mapId, 'dest', dest, r); continue; }
 		}
-		// Dest-less POI (e.g. an amenity — restroom, printer, exit) that still
-		// carries a Jibestream waypoint externalId and its floor mapId. Group it
-		// on that floor so the pin loop can resolve the waypoint's own coordinate
-		// via the JMap controller (activeVenue.maps.<mapId>.waypoints).
-		if (r.externalId != null && r.mapId != null) { pushItem(r.mapId, 'waypoint', null, r); continue; }
 		unresolved++;
 	}
 
