@@ -197,6 +197,7 @@ export function mountIndoorMap(
 		// once the type lands).
 		autoReroute: options.autoReroute ?? true,
 		gps: options.gps ?? false,
+		bookable: options.bookable ?? true,
 		booking: options.booking,
 		colleagues: options.colleagues,
 		images: options.images,

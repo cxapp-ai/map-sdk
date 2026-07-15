@@ -119,6 +119,20 @@ export interface MapResource {
 	 * whatever your backend needs (times, meetingId, resource ids…).
 	 */
 	bookingContext?: unknown;
+	/**
+	 * Explicit pin placement for POIs the destination index can't resolve.
+	 * When `mapId` + `worldX` + `worldY` are all set, the pin is placed
+	 * directly at that world coordinate on that floor — no destination or
+	 * unit lookup. When only `mapId` is set alongside an `externalId` that is
+	 * a Jibestream waypointId, the pin resolves through that floor's waypoint
+	 * collection (amenities — restrooms, printers, exits — live there rather
+	 * than in the destination index). Coordinates are in the OWN floor's
+	 * world frame; a waypoint found only on another floor is route-usable
+	 * but never pinned.
+	 */
+	mapId?: number;
+	worldX?: number;
+	worldY?: number;
 }
 
 export interface ColleagueBooking {
@@ -293,6 +307,14 @@ export interface MapSdkOptions {
 	 * itinerary draw. Set false to never contact the CDN. Default true.
 	 */
 	autoReroute?: boolean;
+	/**
+	 * Whether carousel cards offer a "Book" action and a resource thumbnail.
+	 * Default true (desks/rooms). Set false for location-only surfaces
+	 * (amenity/wayfinding POIs — restrooms, coffee, exits): cards show name +
+	 * details only, no Book button, no thumbnail. Booking also requires the
+	 * `booking` plugin — `bookable` is the per-mount switch on top of it.
+	 */
+	bookable?: boolean;
 	booking?: BookingPlugin;
 	colleagues?: ColleaguesPlugin;
 	images?: ImageLoaderPlugin;

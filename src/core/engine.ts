@@ -462,6 +462,52 @@ function unitCenterFromPoints(u: unknown): { x: number; y: number } | null {
 	return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
 }
 
+// Read a JMap Waypoint's world coordinate. jmap.js v4 exposes it directly
+// (wp.x / wp.y), under the raw `_` payload (wp._.x / wp._.y), or as a
+// `coordinates: [x, y]` pair — probe all shapes via readPoint.
+function readWaypointCoord(wp: unknown): { x: number; y: number } | null {
+	if (!wp) return null;
+	const w = wp as { _?: { coordinates?: unknown }; coordinates?: unknown };
+	return readPoint(wp)
+		?? readPoint(w._)
+		?? readPoint(w.coordinates)
+		?? readPoint(w._?.coordinates);
+}
+
+// Resolve a Jibestream waypointId to its JMap Waypoint object. Waypoints live
+// at activeVenue.maps.getById(mapId).waypoints.getById(id) — the only public
+// surface for this lookup. Tries the preferred (own-floor) map first (O(1)),
+// then scans all maps. `onPreferredMap` records which one hit: waypoint
+// coordinates are in their OWN map's frame, so a cross-map hit is safe to
+// anchor a route (wayfinding re-projects) but NOT to place a pin on
+// `preferredMapId`. Best-effort: returns null on any failure.
+function lookupWaypoint(
+	activeVenue: unknown,
+	preferredMapId: number,
+	idKey: string,
+	log: (stage: string, msg: string, extra?: unknown) => void,
+): { wp: unknown; onPreferredMap: boolean } | null {
+	const wpNum = Number(idKey);
+	if (!Number.isFinite(wpNum)) return null;
+	try {
+		const av = activeVenue as {
+			maps?: {
+				getById?: (id: number) => { waypoints?: { getById?: (id: number) => unknown } } | null;
+				getAll?: () => Array<{ waypoints?: { getById?: (id: number) => unknown } }>;
+			}
+		} | null;
+		const own = av?.maps?.getById?.(preferredMapId)?.waypoints?.getById?.(wpNum);
+		if (own) return { wp: own, onPreferredMap: true };
+		for (const m of av?.maps?.getAll?.() ?? []) {
+			const found = m.waypoints?.getById?.(wpNum);
+			if (found) return { wp: found, onPreferredMap: false };
+		}
+	} catch (e) {
+		log('minimap', 'waypoint lookup threw', e);
+	}
+	return null;
+}
+
 function getCollection(activeVenue: unknown, key: string): {
 	getById?: (id: number) => unknown;
 	getAll?: () => unknown[];
@@ -715,25 +761,51 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	jmapPromise.catch(() => {});
 	const venue: VenueData = await loadVenue(cfg, opts.logger);
 
-	// Resolve resources → group by floor.
+	// Resolve resources → group by floor. Each item records HOW it resolved
+	// (`kind`) — the pin loop switches on that decision instead of re-deriving
+	// it from raw fields, so the coordinate-source priority (explicit coords >
+	// destination index > waypoint lookup) is encoded exactly once, here.
+	type PinKind = 'coords' | 'dest' | 'waypoint';
 	interface FloorGroup {
 		mapId: number;
 		mapName: string;
-		items: Array<{ dest: Destination; res: MapResource }>;
+		items: Array<{ kind: PinKind; dest: Destination | null; res: MapResource }>;
 	}
 	const byMap = new Map<number, FloorGroup>();
 	let unresolved = 0;
-	for (const r of opts.resources) {
-		const dest = resolveDestination(venue, r);
-		if (!dest) { unresolved++; continue; }
-		const mapId = dest.locations?.[0]?.mapId;
-		if (!mapId) { unresolved++; continue; }
+	const pushItem = (mapId: number, kind: PinKind, dest: Destination | null, r: MapResource) => {
 		let g = byMap.get(mapId);
 		if (!g) {
 			g = { mapId, mapName: '', items: [] };
 			byMap.set(mapId, g);
 		}
-		g.items.push({ dest, res: r });
+		g.items.push({ kind, dest, res: r });
+	};
+	for (const r of opts.resources) {
+		// Explicit-coordinate pins (host-supplied world x/y) place directly —
+		// no resolveDestination needed.
+		if (r.mapId != null && r.worldX != null && r.worldY != null) {
+			pushItem(r.mapId, 'coords', null, r);
+			continue;
+		}
+		// Host-explicit placement wins over the destination index: a resource
+		// carrying BOTH its floor (mapId) and a waypoint externalId has already
+		// chosen WHICH instance of the POI to show (bond's map agent selects
+		// per-floor instances for counts/nearest/routes, and amenities aren't
+		// in the destination index at all). Resolving through the destination
+		// index here would re-group on the destination's FIRST location and
+		// pin a multi-floor POI on the wrong level. Resources without a mapId
+		// (booking flows) still resolve through the index below.
+		if (r.externalId != null && r.mapId != null) {
+			pushItem(r.mapId, 'waypoint', null, r);
+			continue;
+		}
+		const dest = resolveDestination(venue, r);
+		if (dest) {
+			const mapId = dest.locations?.[0]?.mapId;
+			if (mapId) { pushItem(mapId, 'dest', dest, r); continue; }
+		}
+		unresolved++;
 	}
 
 	if (byMap.size === 0) {
@@ -931,47 +1003,36 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		const mapObj = mapsColl?.getById?.(g.mapId);
 
 		for (const it of g.items) {
-			const unit = lookupUnitForResource(control, activeVenue, mapObj, destColl, it.dest, it.res, jibLog);
-			if (!unit) continue;
-			const c = unitCenterFromPoints(unit);
-			if (!c) continue;
-			pins.push({ resource: it.res, worldX: c.x, worldY: c.y });
-
-			// Cache the JMap Waypoint object for wayfinding. For resources whose
-			// externalId is a Jibestream waypointId, look the waypoint up via
-			// activeVenue.maps.getById(mapId).waypoints.getById(id) — the only
-			// public surface for this lookup. Best-effort: lookup failures
-			// are silent and just mean this pin can't anchor a route.
+			// Resolve the JMap Waypoint object for this resource's externalId
+			// ONCE — it anchors routes (wayfinding cache) and, for waypoint-kind
+			// items, places the pin at the waypoint's own coordinate. Best-effort:
+			// lookup failures just mean this pin can't anchor a route.
 			const externalIdKey = it.res.externalId != null ? String(it.res.externalId) : null;
-			if (externalIdKey) {
-				try {
-					const wpNum = Number(externalIdKey);
-					// Waypoints live at activeVenue.maps.getById(mapId).waypoints.getById(id).
-					// Try the resource's own map first (O(1)), then scan all maps (fallback).
-					if (Number.isFinite(wpNum)) {
-						const av = activeVenue as {
-							maps?: {
-								getById?: (id: number) => {
-									waypoints?: { getById?: (id: number) => unknown }
-								} | null;
-								getAll?: () => Array<{
-									waypoints?: { getById?: (id: number) => unknown }
-								}>;
-							}
-						} | null;
-						// Try the resource's own map first (O(1)), then scan all maps (fallback).
-						let wp: unknown =
-							av?.maps?.getById?.(g.mapId)?.waypoints?.getById?.(wpNum) ?? null;
-						if (!wp) {
-							const allMaps = av?.maps?.getAll?.() ?? [];
-							for (const m of allMaps) {
-								const found = m.waypoints?.getById?.(wpNum);
-								if (found) { wp = found; break; }
-							}
-						}
-						if (wp) waypointByExternalId.set(externalIdKey, wp);
-					}
-				} catch (e) { jibLog('minimap', 'waypoint cache lookup threw', e); }
+			const wpHit = externalIdKey ? lookupWaypoint(activeVenue, g.mapId, externalIdKey, jibLog) : null;
+			if (wpHit && externalIdKey) waypointByExternalId.set(externalIdKey, wpHit.wp);
+
+			// Place the pin per the resolution kind recorded in the grouping
+			// loop — the priority order lives there, not here.
+			switch (it.kind) {
+				case 'coords':
+					pins.push({ resource: it.res, worldX: it.res.worldX!, worldY: it.res.worldY! });
+					break;
+				case 'dest': {
+					const unit = lookupUnitForResource(control, activeVenue, mapObj, destColl, it.dest!, it.res, jibLog);
+					const c = unit ? unitCenterFromPoints(unit) : null;
+					if (c) pins.push({ resource: it.res, worldX: c.x, worldY: c.y });
+					break;
+				}
+				case 'waypoint': {
+					// Only pin from an own-map waypoint: a cross-map fallback hit
+					// is in ANOTHER map's coordinate frame, and drawing it on this
+					// floor's canvas would misplace the pin (routes are fine — the
+					// cached wp above re-projects through wayfinding).
+					const c = wpHit?.onPreferredMap ? readWaypointCoord(wpHit.wp) : null;
+					if (c) pins.push({ resource: it.res, worldX: c.x, worldY: c.y });
+					else jibLog('minimap', `waypoint ${externalIdKey} not pinnable on map ${g.mapId} (missing or cross-map hit)`);
+					break;
+				}
 			}
 		}
 
