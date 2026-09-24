@@ -44,6 +44,9 @@
 		MapStrings,
 		MapTheme,
 		MapLogger,
+		LocationSelectOptions,
+		MapSelection,
+		FloorSummary,
 	} from '../types.js';
 	import { DEFAULT_STRINGS } from '../strings.js';
 	import { placeholderImageForType } from './placeholders.js';
@@ -145,6 +148,16 @@
 		images?: ImageLoaderPlugin;
 		/** Native-navigation handoff. Without it, Navigate buttons hide. */
 		navigation?: NavigationPlugin;
+		/** Tap-to-select a space/amenity (MapSdkOptions.locationSelect). Off when falsy. */
+		locationSelect?: boolean | LocationSelectOptions;
+		/** Render the resource card carousel. Default true. */
+		showCards?: boolean;
+		/** Floor strip: 'auto' (>1 floor, historical), true (always), false (never). */
+		showFloorSelector?: boolean | 'auto';
+		/** List every venue floor + allow an empty resource set (engine allFloors). */
+		allFloors?: boolean;
+		/** Floor (mapId) to open on, when it is one of the listed floors. */
+		initialFloor?: number;
 		strings?: Partial<MapStrings>;
 		theme?: Partial<MapTheme>;
 		logger?: MapLogger;
@@ -171,6 +184,12 @@
 		colleagues,
 		images,
 		navigation,
+		locationSelect = false,
+		showCards = true,
+		showFloorSelector = 'auto',
+		allFloors = false,
+		// Renamed: the mount effect has a local `initialFloor` for its floor pick.
+		initialFloor: initialFloorProp,
 		strings,
 		theme,
 		logger,
@@ -217,6 +236,19 @@
 	// Image loader: injected plugin, or plain passthrough (the path/URL is
 	// used directly as the <img src>).
 	const loadImage = $derived(images?.load ?? (async (pathOrUrl: string) => pathOrUrl));
+
+	// Location-select mode (tap → space/amenity). Normalised options; null = off,
+	// which means no tap listener, no events and no selection pin at all.
+	const locSel = $derived<LocationSelectOptions | null>(
+		locationSelect ? (typeof locationSelect === 'object' ? locationSelect : {}) : null,
+	);
+	// $state.raw: the selection is an immutable snapshot from the engine
+	// (replaced wholesale per tap); hosts get the plain object back from
+	// getSelection(), never a proxy.
+	let selection = $state.raw<MapSelection | null>(null);
+	// Viewport position of the selection pin; reprojected every frame like pins.
+	let selectionPos = $state.raw<{ x: number; y: number } | null>(null);
+	let unregisterTap: (() => void) | null = null;
 
 	// Live-GPS options (`gps`: bool | GpsOptions).
 	const gpsEnabled = $derived(!!gps);
@@ -434,7 +466,8 @@
 		// tearing down + re-initing the whole engine (a ≥1.3s rebuild for a
 		// pure rename). kioskCoordinate stays in the signature (it changes the
 		// synthetic route start / kiosk-first floor selection — a genuine rebuild).
-		+ '|cfg:' + JSON.stringify({ v: provider.venueId, k: provider.kioskCoordinate }),
+		// allFloors changes the engine's floor list — a genuine rebuild.
+		+ '|cfg:' + JSON.stringify({ v: provider.venueId, k: provider.kioskCoordinate, a: allFloors }),
 	);
 
 	// Reactive floor-label overlay for the floor strip. The engine bakes
@@ -503,6 +536,7 @@
 					// Seam S2: gate + defer NavigationKit (CDN) loading. Snapshot
 					// via untrack — a change shouldn't reactively rebuild here.
 					autoReroute: untrack(() => autoReroute),
+					allFloors: untrack(() => allFloors),
 					// Seam S1: route async post-init engine failures (e.g.
 					// auth-refresh death) to the runtime error channel.
 					onEngineError: (e) => emit('error', { message: e.message, cause: e.cause }),
@@ -513,6 +547,7 @@
 							if (!mm) return;
 							positions = projectPins(mm, currentFloor());
 							startPos = projectStart(mm, syntheticStart);
+							selectionPos = projectSelection(mm);
 							refreshUserOverlay();
 							if (colleaguesEnabled && allColleagueMarkers.length > 0) {
 								colleaguePositions = projectColleagues(mm, currentFloor());
@@ -527,8 +562,13 @@
 				unresolved = inst.state.unresolved;
 				if (selectedMapId == null) {
 					let initialFloor: number | null = null;
+					// Host-requested opening floor wins when it is a listed floor.
+					const wanted = untrack(() => initialFloorProp);
+					if (wanted != null && inst.state.floors.some(f => f.mapId === wanted)) {
+						initialFloor = wanted;
+					}
 					const focusId = untrack(() => activeFocusId);
-					if (focusId !== undefined) {
+					if (initialFloor == null && focusId !== undefined) {
 						const target = String(focusId);
 						for (const f of inst.state.floors) {
 							if (f.pins.some(p => String(p.resource.externalId ?? '') === target)) {
@@ -662,6 +702,24 @@
 				emit('floorchange', id);
 			}
 			if (id == null) lastEmittedMapId = null;
+		});
+	});
+
+	// Location-select: (re)arm the engine tap listener whenever the instance is
+	// (re)built or the host toggles the option. instanceVersion bumps on both
+	// create and teardown, so a rebuilt controller gets a fresh registration
+	// and a torn-down one drops the stale closure.
+	$effect(() => {
+		void instanceVersion;
+		const on = !!locSel;
+		untrack(() => {
+			unregisterTap?.();
+			unregisterTap = null;
+			if (on && mm) unregisterTap = mm.onTap(handleMapTap);
+			if (!on && selection) {
+				selection = null;
+				selectionPos = null;
+			}
 		});
 	});
 
@@ -1529,6 +1587,11 @@
 		unresolved = 0;
 		selectedMapId = null;
 		selectedPin = null;
+		// The controller (and its tap slot) is gone with the instance; the
+		// selection was resolved against that venue/floor set, so drop it too.
+		unregisterTap = null;
+		selection = null;
+		selectionPos = null;
 		load = 'idle';
 		loadError = null;
 		bookingState = { status: 'idle' };
@@ -1834,7 +1897,14 @@
 		}
 	});
 
-	const showFloorChips = $derived(floors.length > 1);
+	// 'auto' keeps the historical rule (strip only when there is a choice);
+	// true forces it even single-floor (a picker wants the floor visible);
+	// false hides it (host drives floors via setFloor).
+	const showFloorChips = $derived(
+		showFloorSelector === true ? floors.length > 0
+			: showFloorSelector === false ? false
+				: floors.length > 1,
+	);
 
 	// Route active → native dot drives the auto-reroute move event; suppress the
 	// HTML overlay dot so it's not doubled (useNativeUserDot's compare-double stays).
@@ -1859,6 +1929,51 @@
 	function pickFloor(mapId: number) {
 		selectedMapId = mapId;
 	}
+
+	// ── Location select (tap → space / amenity) ────────────────────────────
+
+	function projectSelection(inst: MinimapInstance | null): { x: number; y: number } | null {
+		const sel = untrack(() => selection);
+		if (!inst || !sel) return null;
+		const floor = untrack(() => currentFloor());
+		if (!floor || floor.mapId !== sel.mapId) return null;
+		return inst.projectWorldToViewport(sel.worldX, sel.worldY);
+	}
+
+	function handleMapTap(tap: { worldX: number; worldY: number; mapId: number }): void {
+		const inst = mm;
+		const opts = untrack(() => locSel);
+		if (!inst || !opts) return;
+		// A miss (nothing selectable within maxSnapDistance) clears the
+		// selection and still notifies the host — a picker wants to know the
+		// user tapped empty floor.
+		const next = inst.resolveLocation(tap, {
+			selectable: opts.selectable,
+			maxSnapDistance: opts.maxSnapDistance,
+		});
+		selection = next;
+		selectionPos = projectSelection(inst);
+		emit('locationselect', next);
+	}
+
+	/** Location-select: the current selection, or null. */
+	export function getSelection(): MapSelection | null {
+		return selection;
+	}
+
+	/** Location-select: drop the selection + pin; emits locationselect(null). */
+	export function clearSelection(): void {
+		if (!selection) return;
+		selection = null;
+		selectionPos = null;
+		emit('locationselect', null);
+	}
+
+	/** Listed floors, with any runtime floorLabels override applied. */
+	export function getFloors(): FloorSummary[] {
+		const base = mm?.listFloors() ?? [];
+		return base.map(f => ({ ...f, name: provider.floorLabels?.[f.mapId] ?? f.name }));
+	}
 </script>
 
 <div bind:this={rootEl} class="rm-modal-card">
@@ -1867,6 +1982,9 @@
 		{#if load === 'ready' && !switchingFloor}
 			{@render pinList(positions)}
 			{@render routeStartMarker(startPos)}
+			{#if locSel && locSel.showPin !== false}
+				{@render selectionMarker(selectionPos)}
+			{/if}
 			{@render youAreHereMarker(gpsEnabled && !routeForcesNativeDot ? onMapPos(userOverlay) : null)}
 			{#if colleaguesEnabled}
 				{@render colleagueAvatars(colleaguePositions)}
@@ -1915,7 +2033,7 @@
 		<!-- Away chip rendered outside the ready-gate on purpose — REVIEWED #5.
 		     gps:false hides it entirely (no location rendered without consent). -->
 		{@render userOffMapIndicator(gpsEnabled ? userOverlay : null)}
-		{#if load === 'ready' && resources.length > 0}
+		{#if load === 'ready' && showCards && resources.length > 0}
 			{@render resourceCarousel()}
 		{/if}
 	</div>
@@ -1982,6 +2100,27 @@
 			</button>
 		{/if}
 	{/each}
+{/snippet}
+
+{#snippet selectionMarker(pos: { x: number; y: number } | null)}
+	{#if pos && selection}
+		<!-- Location-select pin: same teardrop as resource pins so the map
+		     reads as one system, but a distinct (dark) colour + halo so it is
+		     never mistaken for a resource. pointer-events:none — a tap on the
+		     pin must fall through to the canvas so the user can re-select. -->
+		<div
+			class="rm-pin rm-pin-location"
+			role="img"
+			aria-label={`${t.selectedLocationPrefix} ${selection.name ?? ''}`}
+			style="transform: translate3d({pos.x}px, {pos.y}px, 0) translate(-50%, -100%);"
+		>
+			<svg class="rm-pin-teardrop-icon" viewBox="0 0 24 30" width="22" height="28" aria-hidden="true">
+				<path d="M12 1C6 1 1.5 5.5 1.5 11.3 1.5 19 12 29 12 29s10.5-10 10.5-17.7C22.5 5.5 18 1 12 1Z"
+					fill="currentColor" stroke="#fff" stroke-width="2"/>
+				<circle cx="12" cy="11" r="3.4" fill="#fff"/>
+			</svg>
+		</div>
+	{/if}
 {/snippet}
 
 {#snippet colleagueAvatars(items: Array<{ marker: ColleagueMarker; x: number; y: number } | null>)}
@@ -2736,5 +2875,31 @@
 		0%   { transform: translate(-50%, -50%) scale(1);   opacity: 0.7; }
 		70%  { transform: translate(-50%, -50%) scale(1.6); opacity: 0; }
 		100% { transform: translate(-50%, -50%) scale(1.6); opacity: 0; }
+	}
+
+	/* Location-select pin (tap → space/amenity). Dark by default so it is
+	   distinct from the brand-blue resource pins; themeable via
+	   --map-selection. Sits above resource pins, below the carousel. */
+	.rm-pin-location {
+		pointer-events: none;
+		z-index: 7;
+	}
+	.rm-pin-location .rm-pin-teardrop-icon {
+		color: var(--map-selection, #0f172a);
+		width: 38px;
+		height: 48px;
+		filter: drop-shadow(0 4px 8px rgba(15,23,42,0.5));
+	}
+	.rm-pin-location::before {
+		content: '';
+		position: absolute;
+		left: 50%;
+		top: 50%;
+		width: 56px;
+		height: 56px;
+		border-radius: 50%;
+		background: rgba(15,23,42,0.22);
+		animation: rm-pulse-selected 2s ease-out infinite;
+		pointer-events: none;
 	}
 </style>

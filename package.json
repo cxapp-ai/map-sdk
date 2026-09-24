@@ -24,6 +24,7 @@
     "build": "vite build && vite build --config vite.config.iife.ts",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "dev": "vite --config demo/vite.config.ts",
+    "pages": "vite --config pages/vite.config.ts",
     "prepare": "npm run build"
   },
   "keywords": [

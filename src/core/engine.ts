@@ -29,6 +29,9 @@ import type {
 	MapResource,
 	ColleagueBooking,
 	MapLogger,
+	FloorSummary,
+	MapSelection,
+	SelectableKind,
 } from '../types.js';
 
 export interface FloorInfo {
@@ -262,6 +265,11 @@ interface JController {
 	renderCurrentMapView?: () => unknown;
 	_getParsedMapView?: (map: unknown) => MapViewLike | undefined;
 	showAllPathTypes?: () => void;
+	// Tap plumbing (jmap.js v4). enableGenericTapHandler REPLACES the single
+	// generic-tap slot; the callback's event carries `localPoint` = [x, y] in
+	// the current map's local (world) frame, set by the stage's hit-test.
+	enableGenericTapHandler?: (cb: (e: { localPoint?: unknown }) => void) => unknown;
+	disableGenericTapHandler?: () => unknown;
 }
 
 interface UnitBounds { x: number; y: number; width: number; height: number; }
@@ -551,6 +559,13 @@ export interface CreateMinimapOpts {
 	 * pin-only mount that never draws a route also never hits the CDN.
 	 */
 	autoReroute?: boolean;
+	/**
+	 * List every venue floor (not just floors carrying a pin) and allow an
+	 * empty `resources` array. Floors are ordered by Jibestream level/
+	 * elevation, then mapId; a pin-less floor is framed to its full footprint
+	 * when shown. Default false (historical: pin floors only, pins-desc).
+	 */
+	allFloors?: boolean;
 }
 
 /** Public-surface alias (core/index.ts exports `MinimapOptions`). */
@@ -712,6 +727,31 @@ export interface MinimapInstance {
 	/** Subscribe to the native user-location settle (`MOVING_OBJECT_ANIMATION_COMPLETE`)
 	 *  — the veer-check trigger. Returns an unsubscribe fn (no-op if unavailable). */
 	subscribeUserLocationSettled: (cb: () => void) => () => void;
+	/**
+	 * Register a map-tap listener (location-select mode). The tap arrives in
+	 * the CURRENT floor's world frame. JMap has a single generic-tap slot; the
+	 * engine multiplexes it so several listeners can coexist. Returns an
+	 * unregister function. Taps are not reported while a drag/pan is in
+	 * progress (JMap's own tap detection).
+	 */
+	onTap: (cb: (tap: { worldX: number; worldY: number; mapId: number }) => void) => () => void;
+	/**
+	 * Resolve a world point on a floor to the selectable item at/nearest it:
+	 *   1. a unit polygon containing the point → that space (distance 0);
+	 *   2. the nearest destination/amenity waypoint among `selectable` kinds
+	 *      (ties break by `selectable` order);
+	 *   3. the nearest bare waypoint, only if 'waypoint' is selectable.
+	 * Null when nothing qualifies within `maxSnapDistance` (map units).
+	 * Default selectable: ['space', 'amenity'].
+	 */
+	resolveLocation: (
+		world: { worldX: number; worldY: number; mapId: number },
+		opts?: { selectable?: SelectableKind[]; maxSnapDistance?: number },
+	) => MapSelection | null;
+	/** Viewport pixel → world coord on the current floor (inverse of projectWorldToViewport). */
+	viewportToWorld: (x: number, y: number) => { worldX: number; worldY: number; mapId: number } | null;
+	/** The listed floors (see CreateMinimapOpts.allFloors) with their JMap metadata. */
+	listFloors: () => FloorSummary[];
 	/** Tear down the JMap controller and detach RAF/event listeners. */
 	destroy: () => void;
 }
@@ -808,7 +848,9 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		unresolved++;
 	}
 
-	if (byMap.size === 0) {
+	// Under allFloors an empty resource set is legitimate (venue browser /
+	// location picker) — the floor list comes from the venue's maps below.
+	if (byMap.size === 0 && !opts.allFloors) {
 		throw new Error(unresolved > 0
 			? "Couldn't locate any of these on the map."
 			: 'No floors to render.');
@@ -958,11 +1000,47 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	let lastWayfindSegments: unknown[] = [];
 
 	const mapsColl = getCollection(activeVenue, 'maps') as
-		| { getById?: (id: number) => unknown }
+		| { getById?: (id: number) => unknown; getAll?: () => unknown[] }
 		| null;
 	const destColl = getCollection(activeVenue, 'destinations') as
 		| { getById?: (id: number) => unknown }
 		| null;
+	const buildingsColl = getCollection(activeVenue, 'buildings') as
+		| { getFloorByMap?: (map: unknown) => unknown }
+		| null;
+
+	// Floor labels live on the JMap FLOOR model (name / shortName / level /
+	// elevation) — the Map model only carries geometry (width, height, svg…).
+	// Resolve through buildings.getFloorByMap(map). NOTE: JMap types
+	// Floor.shortName as Number and silently drops a string value from the
+	// CMS, so shortName can be null even when the venue has one configured.
+	type FloorMeta = { name: string | null; shortName: number | null; level: number | null; elevation: number | null };
+	function floorMeta(mapId: number): FloorMeta {
+		const out: FloorMeta = { name: null, shortName: null, level: null, elevation: null };
+		const mapObj = mapsColl?.getById?.(mapId);
+		if (!mapObj) return out;
+		try {
+			const fl = buildingsColl?.getFloorByMap?.(mapObj) as
+				| { name?: unknown; shortName?: unknown; level?: unknown; elevation?: unknown }
+				| null
+				| undefined;
+			if (fl) {
+				if (typeof fl.name === 'string' && fl.name) out.name = fl.name;
+				if (typeof fl.shortName === 'number') out.shortName = fl.shortName;
+				if (typeof fl.level === 'number') out.level = fl.level;
+				if (typeof fl.elevation === 'number') out.elevation = fl.elevation;
+			}
+		} catch (e) {
+			jibLog('minimap', 'getFloorByMap threw', e);
+		}
+		return out;
+	}
+	// Display label for a floor from JMap data alone (no host override):
+	// Floor.name, then its numeric shortName, then the raw id as a last resort.
+	function floorBaseName(mapId: number): string {
+		const fm = floorMeta(mapId);
+		return fm.name ?? (fm.shortName != null ? String(fm.shortName) : `Floor ${mapId}`);
+	}
 
 	for (const g of byMap.values()) {
 		const m = mapsColl?.getById?.(g.mapId) as
@@ -974,7 +1052,13 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		// "Level 1"). Only use the numeric mapId fallback as a last resort
 		// — the raw id is meaningless to users.
 		const resourceFloor = g.items.find(it => !!it.res.floorName)?.res.floorName;
-		g.mapName = m?.name || m?.shortName || m?.floorName || resourceFloor || `Floor ${g.mapId}`;
+		// The Map model carries no name in practice (floor labels are on the
+		// Floor model — see floorMeta); the Map probes are kept for parity with
+		// older payloads, the Floor model is the real source.
+		const fm = floorMeta(g.mapId);
+		g.mapName = m?.name || m?.shortName || m?.floorName || fm.name
+			|| (fm.shortName != null ? String(fm.shortName) : '')
+			|| resourceFloor || `Floor ${g.mapId}`;
 		// Host-supplied floor label overrides (e.g. { 7659: 'Floor 1', 8837: 'Floor 2' }).
 		// Takes precedence over all JMap-derived names so venue-specific map IDs
 		// never appear in the UI.
@@ -1050,13 +1134,33 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 			| { name?: string; shortName?: string; floorName?: string }
 			| null
 			| undefined;
-		const baseName = kMapObj?.name || kMapObj?.shortName || kMapObj?.floorName || `Floor ${kMapId}`;
+		const baseName = kMapObj?.name || kMapObj?.shortName || kMapObj?.floorName || floorBaseName(kMapId);
 		const labeled = cfg.floorLabels?.[kMapId] ?? baseName;
 		floors.push({ mapId: kMapId, mapName: labeled, pins: [] });
 	}
 
-	floors.sort((a, b) => (b.pins.length - a.pins.length) || (a.mapId - b.mapId));
-	const dominantMapId = floors[0]?.mapId ?? null;
+	// Venue-wide floor list (opts.allFloors): every JMap map, not just the
+	// ones carrying pins, in building order (level/elevation) — what a floor
+	// selector wants. Without the flag keep the historical pins-desc order.
+	if (opts.allFloors) {
+		for (const m of (mapsColl?.getAll?.() ?? []) as Array<{ id?: number }>) {
+			if (typeof m.id !== 'number' || floors.some(f => f.mapId === m.id)) continue;
+			floors.push({ mapId: m.id, mapName: cfg.floorLabels?.[m.id] ?? floorBaseName(m.id), pins: [] });
+		}
+		const order = (mapId: number): number => {
+			const fm = floorMeta(mapId);
+			return fm.level ?? fm.elevation ?? fm.shortName ?? mapId;
+		};
+		floors.sort((a, b) => (order(a.mapId) - order(b.mapId)) || (a.mapId - b.mapId));
+	} else {
+		floors.sort((a, b) => (b.pins.length - a.pins.length) || (a.mapId - b.mapId));
+	}
+	// Dominant = most pins (first in list on ties); with no pins at all
+	// (allFloors, empty resources) it is the first floor in building order.
+	const dominantMapId = floors.reduce<FloorInfo | null>(
+		(best, f) => (best == null || f.pins.length > best.pins.length ? f : best),
+		null,
+	)?.mapId ?? null;
 
 	// --- View management -----------------------------------------------------
 
@@ -1119,7 +1223,14 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		const syntheticPin = (lastSyntheticStartPos && lastSyntheticStartPos.mapId === currentMapId)
 			? { worldX: lastSyntheticStartPos.worldX, worldY: lastSyntheticStartPos.worldY }
 			: null;
-		if (floor.pins.length === 0 && !syntheticPin) return;
+		if (floor.pins.length === 0 && !syntheticPin) {
+			// Nothing to frame. Under allFloors (venue browser / location picker)
+			// fit the whole floor footprint so the user sees the floorplan rather
+			// than JMap's default extent; legacy mounts keep the default extent
+			// (kiosk-only floors were never framed before).
+			if (opts.allFloors) frameWholeFloor();
+			return;
+		}
 		const allPoints = syntheticPin ? [...floor.pins, syntheticPin] : floor.pins;
 		const rect: UnitBounds | null = allPoints.length === 1
 			? { x: allPoints[0].worldX - 4, y: allPoints[0].worldY - 4, width: 8, height: 8 }
@@ -1135,6 +1246,44 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		if (typeof view?.fitBoundsInView === 'function') {
 			try { view.fitBoundsInView({ bounds: { ...rect }, padding, speed: 0 }); }
 			catch (e) { jibLog('minimap', 'fitBoundsInView threw', e); }
+		}
+		opts.onViewChange?.();
+	}
+
+	function frameWholeFloor(): void {
+		if (currentMapId == null) return;
+		// Prefer the union of the floor's unit polygons (the building footprint)
+		// over the full map extent, which usually includes a lot of outdoor
+		// surroundings that would leave the building small in the viewport.
+		let rect: UnitBounds | null = null;
+		const mapObj = mapsColl?.getById?.(currentMapId);
+		if (mapObj && typeof control.getUnitsFromMap === 'function') {
+			try {
+				const pts: Array<{ worldX: number; worldY: number }> = [];
+				for (const u of control.getUnitsFromMap(mapObj) ?? []) {
+					const c = unitCenterFromPoints(u);
+					if (c) pts.push({ worldX: c.x, worldY: c.y });
+				}
+				if (pts.length >= 2) rect = rectFromPoints(pts);
+			} catch (e) {
+				jibLog('minimap', 'getUnitsFromMap (whole floor) threw', e);
+			}
+		}
+		if (!rect) {
+			const size = floorSizeWorld(currentMapId);
+			if (!size) return;
+			rect = { x: 0, y: 0, width: size.width, height: size.height };
+		}
+		const ctl = control as Record<string, unknown>;
+		const stage = ctl.stage as Record<string, unknown> | undefined;
+		const view = stage?.currentMapView as {
+			fitBoundsInView?: (opts: Record<string, unknown>) => unknown;
+		} | undefined;
+		if (typeof view?.fitBoundsInView !== 'function') return;
+		try {
+			view.fitBoundsInView({ bounds: { ...rect }, padding: Math.max(24, Math.max(rect.width, rect.height) * 0.15), speed: 0 });
+		} catch (e) {
+			jibLog('minimap', 'fitBoundsInView (whole floor) threw', e);
 		}
 		opts.onViewChange?.();
 	}
@@ -1893,6 +2042,249 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		return out;
 	}
 
+	// --- Location select (tap → space / amenity) -------------------------------
+	//
+	// Mirrors the main app's proven tap flow (cx_map handleInteractivity):
+	// enableGenericTapHandler → e.localPoint → getClosestWaypointToCoordinatesOnMap
+	// → waypoint.associations.{destinations,amenities}. Here the candidate set
+	// is built explicitly per floor instead, so the nearest item is always of a
+	// kind the host asked for (nearest corridor waypoint ≠ nearest room).
+
+	type TapPoint = { worldX: number; worldY: number; mapId: number };
+	type JModel = {
+		id?: number;
+		name?: string | null;
+		externalId?: string | null;
+		description?: string | null;
+		keywords?: unknown[];
+		tags?: unknown[];
+		locations?: { getAll?: () => Array<{ mapId?: number; waypointIds?: number[] }> } | Array<{ mapId?: number; waypointIds?: number[] }>;
+		_?: Record<string, unknown>;
+		export?: () => unknown;
+	};
+	type JWaypoint = { id?: number; mapId?: number; _?: Record<string, unknown>; export?: () => unknown };
+
+	// JMap has ONE generic-tap slot (each enableGenericTapHandler call replaces
+	// it), so register with JMap once and fan out to our own listener set.
+	const tapListeners = new Set<(tap: TapPoint) => void>();
+	let genericTapArmed = false;
+	function onTap(cb: (tap: TapPoint) => void): () => void {
+		tapListeners.add(cb);
+		if (!genericTapArmed && typeof control.enableGenericTapHandler === 'function') {
+			try {
+				control.enableGenericTapHandler((e) => {
+					const p = readPoint(e?.localPoint);
+					if (!p || currentMapId == null) return;
+					const tap: TapPoint = { worldX: p.x, worldY: p.y, mapId: currentMapId };
+					for (const l of tapListeners) {
+						try { l(tap); } catch (err) { jibLog('minimap', 'tap listener threw', err); }
+					}
+				});
+				genericTapArmed = true;
+			} catch (e) {
+				jibLog('minimap', 'enableGenericTapHandler threw', e);
+			}
+		}
+		return () => { tapListeners.delete(cb); };
+	}
+
+	function viewportToWorld(x: number, y: number): TapPoint | null {
+		if (currentMapId == null) return null;
+		const ctl = control as Record<string, unknown>;
+		const stage = ctl.stage as { getMapPointFromViewPortPoint?: (p: [number, number]) => [number, number] } | undefined;
+		if (typeof stage?.getMapPointFromViewPortPoint !== 'function') return null;
+		try {
+			const [wx, wy] = stage.getMapPointFromViewPortPoint([x, y]);
+			if (!Number.isFinite(wx) || !Number.isFinite(wy)) return null;
+			return { worldX: wx, worldY: wy, mapId: currentMapId };
+		} catch {
+			return null;
+		}
+	}
+
+	// JSON snapshot of a JMap model: its export() when available, else the raw
+	// `_` payload bag. Null for non-objects / non-serialisable values.
+	function exportModel(m: unknown): Record<string, unknown> | null {
+		if (!m || typeof m !== 'object') return null;
+		const mm = m as JModel;
+		try {
+			if (typeof mm.export === 'function') return mm.export() as Record<string, unknown>;
+		} catch { /* fall through to the raw bag */ }
+		if (mm._ && typeof mm._ === 'object') {
+			try { return JSON.parse(JSON.stringify(mm._)) as Record<string, unknown>; } catch { return null; }
+		}
+		return null;
+	}
+
+	// Destination/amenity `locations` is a JMap collection in v4 (getAll()),
+	// a plain array on older payloads, or only present under the raw `_` bag.
+	function modelLocations(m: JModel): Array<{ mapId?: number; waypointIds?: number[] }> {
+		const loc = m.locations;
+		if (Array.isArray(loc)) return loc;
+		if (loc && typeof loc.getAll === 'function') {
+			try { return loc.getAll() ?? []; } catch { return []; }
+		}
+		const raw = m._?.locations;
+		return Array.isArray(raw) ? (raw as Array<{ mapId?: number; waypointIds?: number[] }>) : [];
+	}
+
+	function waypointOnMap(mapObj: unknown, wpId: number): JWaypoint | null {
+		const m = mapObj as { waypoints?: { getById?: (id: number) => unknown } } | null | undefined;
+		try { return (m?.waypoints?.getById?.(wpId) as JWaypoint | undefined) ?? null; } catch { return null; }
+	}
+
+	// Ray-casting point-in-polygon over a JMap unit shape's `points` (map-local
+	// frame — the same frame as e.localPoint and the pin world coords).
+	function pointInPolygon(pt: { x: number; y: number }, poly: unknown): boolean {
+		if (!Array.isArray(poly) || poly.length < 3) return false;
+		let inside = false;
+		for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+			const a = readPoint(poly[i]);
+			const b = readPoint(poly[j]);
+			if (!a || !b) continue;
+			const crosses = (a.y > pt.y) !== (b.y > pt.y)
+				&& pt.x < ((b.x - a.x) * (pt.y - a.y)) / (b.y - a.y) + a.x;
+			if (crosses) inside = !inside;
+		}
+		return inside;
+	}
+
+	// Per-floor candidate index: every destination + amenity waypoint on the
+	// map with its coordinate. Built lazily on first tap per floor; the venue
+	// is immutable for the life of the controller so it never invalidates.
+	interface Candidate { kind: 'space' | 'amenity'; model: JModel; wp: JWaypoint; x: number; y: number }
+	const candidateCache = new Map<number, Candidate[]>();
+	function candidatesOn(mapId: number): Candidate[] {
+		const hit = candidateCache.get(mapId);
+		if (hit) return hit;
+		const mapObj = mapsColl?.getById?.(mapId);
+		const out: Candidate[] = [];
+		const push = (kind: 'space' | 'amenity', coll: { getAll?: () => unknown[] } | null): void => {
+			let items: unknown[] = [];
+			try { items = coll?.getAll?.() ?? []; } catch (e) { jibLog('minimap', `${kind} getAll threw`, e); }
+			for (const m of items as JModel[]) {
+				for (const loc of modelLocations(m)) {
+					if (loc.mapId !== mapId) continue;
+					for (const wpId of loc.waypointIds ?? []) {
+						const wp = waypointOnMap(mapObj, wpId);
+						const c = wp ? readWaypointCoord(wp) : null;
+						if (wp && c) out.push({ kind, model: m, wp, x: c.x, y: c.y });
+					}
+				}
+			}
+		};
+		push('space', destColl as { getAll?: () => unknown[] } | null);
+		push('amenity', getCollection(activeVenue, 'amenities'));
+		candidateCache.set(mapId, out);
+		return out;
+	}
+
+	function buildSelection(
+		kind: SelectableKind,
+		world: TapPoint,
+		item: { model: JModel | null; wp: JWaypoint | null; x: number; y: number; unitMeta?: unknown },
+		distance: number,
+	): MapSelection {
+		const floor = floors.find(f => f.mapId === world.mapId);
+		const fm = floorMeta(world.mapId);
+		const model = item.model;
+		const isAmenity = kind === 'amenity';
+		const raw: Record<string, unknown> = {};
+		if (model) raw[isAmenity ? 'amenity' : 'destination'] = exportModel(model);
+		if (item.wp) raw.waypoint = exportModel(item.wp);
+		if (item.unitMeta) raw.unit = item.unitMeta;
+		return {
+			kind,
+			mapId: world.mapId,
+			floorName: floor?.mapName ?? cfg.floorLabels?.[world.mapId] ?? floorBaseName(world.mapId),
+			floorShortName: fm.shortName,
+			floorLevel: fm.level,
+			venueId: cfg.venueId,
+			name: model?.name ?? null,
+			externalId: model?.externalId != null && model.externalId !== '' ? String(model.externalId) : null,
+			destinationId: !isAmenity && typeof model?.id === 'number' ? model.id : null,
+			amenityId: isAmenity && typeof model?.id === 'number' ? model.id : null,
+			waypointId: typeof item.wp?.id === 'number' ? item.wp.id : null,
+			worldX: item.x,
+			worldY: item.y,
+			tapWorldX: world.worldX,
+			tapWorldY: world.worldY,
+			distance,
+			keywords: Array.isArray(model?.keywords) ? model.keywords.map(String) : [],
+			tags: Array.isArray(model?.tags) ? model.tags.map(String) : [],
+			description: model?.description ?? null,
+			raw,
+		};
+	}
+
+	function resolveLocation(
+		world: TapPoint,
+		ropts: { selectable?: SelectableKind[]; maxSnapDistance?: number } = {},
+	): MapSelection | null {
+		const selectable: SelectableKind[] = ropts.selectable && ropts.selectable.length > 0
+			? ropts.selectable
+			: ['space', 'amenity'];
+		const maxD = ropts.maxSnapDistance ?? Infinity;
+		const mapObj = mapsColl?.getById?.(world.mapId);
+		if (!mapObj) return null;
+		const tap = { x: world.worldX, y: world.worldY };
+
+		// 1. Tap inside a unit polygon → that space. Units with neither a
+		//    destination nor a waypoint (unassigned floor area) are skipped.
+		if (selectable.includes('space') && typeof control.getUnitsFromMap === 'function') {
+			let units: unknown[] = [];
+			try { units = control.getUnitsFromMap(mapObj) ?? []; }
+			catch (e) { jibLog('minimap', 'getUnitsFromMap threw', e); }
+			for (const u of units) {
+				const shape = u as { points?: unknown; meta?: { destinationIds?: number[]; waypointIds?: number[] } };
+				if (!pointInPolygon(tap, shape.points)) continue;
+				const destId = shape.meta?.destinationIds?.[0];
+				const wpId = shape.meta?.waypointIds?.[0];
+				if (destId == null && wpId == null) continue;
+				const model = destId != null ? ((destColl?.getById?.(destId) as JModel | undefined) ?? null) : null;
+				const wp = wpId != null ? waypointOnMap(mapObj, wpId) : null;
+				const c = (wp ? readWaypointCoord(wp) : null) ?? unitCenterFromPoints(u) ?? tap;
+				return buildSelection('space', world, { model, wp, x: c.x, y: c.y, unitMeta: shape.meta ?? null }, 0);
+			}
+		}
+
+		// 2. Nearest destination / amenity waypoint among the selectable kinds.
+		let best: Candidate | null = null;
+		let bestD = Infinity;
+		for (const c of candidatesOn(world.mapId)) {
+			if (!selectable.includes(c.kind)) continue;
+			const d = Math.hypot(c.x - tap.x, c.y - tap.y);
+			const wins = d < bestD
+				|| (d === bestD && best != null && selectable.indexOf(c.kind) < selectable.indexOf(best.kind));
+			if (wins) { best = c; bestD = d; }
+		}
+		if (best && bestD <= maxD) return buildSelection(best.kind, world, best, bestD);
+
+		// 3. Bare waypoint fallback (corridor tap far from any POI).
+		if (selectable.includes('waypoint')) {
+			const wp = resolveCoordinateWaypoint({ mapId: world.mapId, x: tap.x, y: tap.y }) as JWaypoint | null;
+			const c = wp ? readWaypointCoord(wp) : null;
+			if (wp && c) {
+				const d = Math.hypot(c.x - tap.x, c.y - tap.y);
+				if (d <= maxD) return buildSelection('waypoint', world, { model: null, wp, x: c.x, y: c.y }, d);
+			}
+		}
+		return null;
+	}
+
+	function listFloors(): FloorSummary[] {
+		return floors.map(f => {
+			const fm = floorMeta(f.mapId);
+			return {
+				mapId: f.mapId,
+				name: f.mapName,
+				shortName: fm.shortName,
+				level: fm.level,
+				hasPins: f.pins.length > 0,
+			};
+		});
+	}
+
 	// Continue guarding the armed auth-shim timer through to the successful
 	// return: any throw during initial floor framing / settle must still
 	// dispose the shim before propagating.
@@ -1937,6 +2329,10 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		centerOnWorld,
 		hasUserVeeredOffRoute,
 		subscribeUserLocationSettled,
+		onTap,
+		resolveLocation,
+		viewportToWorld,
+		listFloors,
 		destroy,
 	};
 }

@@ -4,9 +4,9 @@
  *
  * Exercises the public surface: mountIndoorMap, fullscreen toggle, itinerary
  * draw/clear, a mock booking plugin (2s delay → confirmed), a GPS mock
- * toggle (remounts — `gps` is a mount option), focusResource, and a log
- * panel fed EXCLUSIVELY by the `mapsdk:*` DOM CustomEvents dispatched on the
- * container — proving the no-bundler-interop event path works.
+ * toggle (remounts — `gps` is a mount option), and focusResource. The
+ * `mapsdk:*` DOM CustomEvents dispatched on the container are logged to the
+ * browser console — proving the no-bundler-interop event path works.
  *
  * Credentials come from demo/.env.local (VITE_JIBESTREAM_*) — see
  * demo/README.md. Never commit secrets.
@@ -18,16 +18,15 @@ import {
 } from '@cxapp-ai/map-sdk';
 
 const mapEl = document.getElementById('map') as HTMLElement;
-const logEl = document.getElementById('log') as HTMLPreElement;
 const btnFullscreen = document.getElementById('btn-fullscreen') as HTMLButtonElement;
 const btnItinerary = document.getElementById('btn-itinerary') as HTMLButtonElement;
 const btnGps = document.getElementById('btn-gps') as HTMLButtonElement;
 const btnFocus = document.getElementById('btn-focus') as HTMLButtonElement;
+const btnLocSel = document.getElementById('btn-locsel') as HTMLButtonElement;
 
 function log(line: string): void {
 	const ts = new Date().toISOString().slice(11, 23);
-	logEl.textContent += `${ts}  ${line}\n`;
-	logEl.scrollTop = logEl.scrollHeight;
+	console.log(`${ts}  ${line}`);
 }
 
 // ── Env (demo-only; the SDK itself never reads env) ─────────────────────────
@@ -73,8 +72,8 @@ const EVENT_NAMES = [
 	'floorchange',
 	'bookrequested',
 	'bookingstatechange',
-	'navigaterequested',
 	'fullscreenchange',
+	'locationselect',
 	'error',
 ] as const;
 
@@ -84,7 +83,9 @@ function summarize(detail: unknown): string {
 	const d = detail as Record<string, unknown>;
 	const r = (d.resource ?? detail) as Record<string, unknown>;
 	const bits: string[] = [];
+	if (typeof r.kind === 'string') bits.push(`kind=${r.kind}`);
 	if (typeof r.name === 'string') bits.push(`name=${r.name}`);
+	if (typeof r.floorName === 'string') bits.push(`floor=${r.floorName}`);
 	if (r.externalId != null) bits.push(`externalId=${String(r.externalId)}`);
 	if (typeof d.status === 'string') bits.push(`status=${d.status}`);
 	if (typeof d.message === 'string') bits.push(`message=${d.message}`);
@@ -109,6 +110,7 @@ for (const name of EVENT_NAMES) {
 
 let handle: IndoorMapHandle | null = null;
 let gpsMockOn = false;
+let locSelOn = false;
 let itineraryOn = false;
 
 function mountMap(): void {
@@ -157,11 +159,9 @@ function mountMap(): void {
 				return { confirmed: true, reservationId: `demo-${Date.now()}` };
 			},
 		},
-		// Host navigation stub so the Navigate button shows (in a CX WebView
-		// you'd pass cxaiNavigationPlugin() ?? undefined instead).
-		navigation: {
-			onNavigate: (resource) => log(`[host] navigation.onNavigate(${resource.name})`),
-		},
+		// Location-select demo: tap anywhere → nearest space/amenity, every
+		// venue floor listed, floor strip forced on. Watch mapsdk:locationselect.
+		...(locSelOn ? { locationSelect: true, allFloors: true, showFloorSelector: true as const } : {}),
 		logger: console,
 		on: {
 			// Callback path (in addition to the CustomEvents logged above).
@@ -199,6 +199,13 @@ btnGps.addEventListener('click', () => {
 	gpsMockOn = !gpsMockOn;
 	btnGps.textContent = `GPS mock: ${gpsMockOn ? 'on' : 'off'}`;
 	log(`[host] GPS mock ${gpsMockOn ? 'on' : 'off'} — remounting (gps is a mount option)`);
+	mountMap();
+});
+
+btnLocSel.addEventListener('click', () => {
+	locSelOn = !locSelOn;
+	btnLocSel.textContent = `Location select: ${locSelOn ? 'on' : 'off'}`;
+	log(`[host] location select ${locSelOn ? 'on' : 'off'} — remounting (mount option)`);
 	mountMap();
 });
 

@@ -297,6 +297,53 @@ there is a ~1.3s settle before the map is interactive. Treat these as a
 remount, not a patch — call `setResources` once with the final set, and
 **batch** config changes into a single `update()` to avoid stacking reloads.
 
+## Location select (tap to pick a space)
+
+Opt-in mode for pickers — "which room/desk/amenity is this ticket about?",
+"where should the meeting be?". Off unless `locationSelect` is set: existing
+mounts see no new tap handling, events or pins.
+
+```ts
+const map = mountIndoorMap(el, {
+  provider,
+  resources: [],            // a picker needs no pins…
+  allFloors: true,          // …but every venue floor in the strip
+  showFloorSelector: true,  // strip even on a single-floor venue
+  showCards: false,         // no carousel
+  initialFloor: 7659,       // optional opening floor (mapId)
+  locationSelect: {
+    selectable: ['space', 'amenity'], // what a tap may resolve to; order = tie-break
+    maxSnapDistance: 400,             // map units; omit for no limit
+    showPin: true,
+  },
+  postMessage: true,        // also mirror events to window.parent (iframe hosts)
+  on: {
+    onLocationSelect: (sel) => {
+      if (!sel) return;    // tap with nothing selectable in range → cleared
+      console.log(sel.kind, sel.name, sel.externalId, sel.floorName, sel.raw);
+    },
+  },
+});
+
+map.getSelection();  // MapSelection | null — same payload as the event
+map.clearSelection();
+map.getFloors();     // [{ mapId, name, shortName, level, hasPins }]
+```
+
+How a tap resolves (`resolveLocation` in the engine): a unit polygon
+containing the tap wins (kind `'space'`, distance 0); otherwise the nearest
+destination/amenity waypoint among the `selectable` kinds; `'waypoint'`, if
+listed, is a last-resort bare routing point. `MapSelection` carries the
+item's name, Jibestream `externalId` (the venue's own space code),
+destination/amenity/waypoint ids, floor (`mapId`, `floorName`, numeric
+`floorShortName`), tap + item world coords, `keywords`/`tags`/`description`,
+and `raw` — JSON exports of the matched Jibestream models for anything else.
+
+DOM event: `mapsdk:locationselect`. With `postMessage`, every `mapsdk:*` event
+is also posted to `window.parent` as `{ source: 'map-sdk', type, detail }`
+(set `targetOrigin` for production embeds). See `pages/moo/` for a complete
+raw-HTML picker built on this.
+
 ## Engine-only (`/core`)
 
 Hosts that want to draw their own overlays can skip the bundled UI:

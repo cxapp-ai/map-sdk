@@ -228,6 +228,109 @@ export interface ItineraryOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Location selection (tap-to-select a space / amenity on the map)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a map tap may resolve to.
+ *  - 'space'    — a unit/destination (rooms, desks, offices — anything in the
+ *                 Jibestream destination index). A tap INSIDE a unit polygon
+ *                 wins; otherwise the nearest destination waypoint.
+ *  - 'amenity'  — an amenity POI (restrooms, printers, exits, …).
+ *  - 'waypoint' — a bare routing waypoint, used only when nothing else is
+ *                 selectable near the tap.
+ */
+export type SelectableKind = 'space' | 'amenity' | 'waypoint';
+
+/**
+ * Opt-in tap-to-select. Off unless configured: with no `locationSelect`
+ * option the map never resolves taps, emits no `locationselect` events and
+ * draws no selection pin — existing hosts see no behaviour change.
+ */
+export interface LocationSelectOptions {
+	/**
+	 * Kinds a tap may resolve to, in preference order for ties. Default
+	 * ['space', 'amenity']. Add 'waypoint' to always get SOMETHING back even
+	 * on a corridor tap far from any POI.
+	 */
+	selectable?: SelectableKind[];
+	/**
+	 * Reject candidates farther than this from the tap, in map units
+	 * (Jibestream local space — roughly pixels of the floor SVG; convert with
+	 * the map's mmPerPixel if you need metres). Default: no limit.
+	 */
+	maxSnapDistance?: number;
+	/** Draw a pin at the selected item. Default true. */
+	showPin?: boolean;
+}
+
+/**
+ * The result of a map tap in location-select mode. Also returned by
+ * `handle.getSelection()`. `raw` carries the underlying Jibestream models
+ * (JSON-exported) so hosts can read venue-specific attributes without the
+ * SDK having to know about them.
+ */
+export interface MapSelection {
+	kind: SelectableKind;
+	/** Floor the item is on (Jibestream mapId). */
+	mapId: number;
+	/** Floor label as shown in the floor strip (floorLabels override applied). */
+	floorName: string;
+	/** Jibestream Map.shortName (numeric in JMap, e.g. 44) when present. */
+	floorShortName: number | null;
+	/** Jibestream Map.level when present. */
+	floorLevel: number | null;
+	venueId: number;
+	/** Item display name (destination/amenity name). Null for bare waypoints. */
+	name: string | null;
+	/**
+	 * Destination externalId from Jibestream — the venue's own space code
+	 * (e.g. an FM system id). Null when Jibestream has none for this item.
+	 */
+	externalId: string | null;
+	destinationId: number | null;
+	amenityId: number | null;
+	/** Routing waypoint the selection is anchored to (also the pin position). */
+	waypointId: number | null;
+	worldX: number;
+	worldY: number;
+	/** Where the user actually tapped, on the same floor. */
+	tapWorldX: number;
+	tapWorldY: number;
+	/** Euclidean distance tap → item, in map units. 0 for a tap inside a unit. */
+	distance: number;
+	keywords: string[];
+	tags: string[];
+	description: string | null;
+	/** JSON exports of the matched Jibestream models (destination / amenity / waypoint / unit meta). */
+	raw: Record<string, unknown>;
+}
+
+/** One floor of the venue, as listed by `handle.getFloors()`. */
+export interface FloorSummary {
+	mapId: number;
+	name: string;
+	shortName: number | null;
+	level: number | null;
+	/** True when at least one of the mounted resources pins on this floor. */
+	hasPins: boolean;
+}
+
+/**
+ * Mirror every `mapsdk:*` event to `window.postMessage` as
+ * `{ source: 'map-sdk', type: '<event>', detail }`, so an iframe/WebView host
+ * page can listen with `window.addEventListener('message', …)` and no DOM
+ * access into the frame. Payloads are structured-cloned; a non-cloneable
+ * detail (e.g. a function inside `bookingContext`) is dropped with a warning.
+ */
+export interface PostMessageOptions {
+	/** 'parent' (default) posts to window.parent; 'self' to the same window. */
+	target?: 'parent' | 'self';
+	/** targetOrigin for postMessage. Default '*' — set it for production embeds. */
+	targetOrigin?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Theming / strings / logging
 // ---------------------------------------------------------------------------
 
@@ -268,6 +371,13 @@ export interface MapEventCallbacks {
 	}) => void;
 	onNavigateRequested: (resource: MapResource) => void;
 	onFullscreenChange: (fullscreen: boolean) => void;
+	/**
+	 * Location-select mode only (`options.locationSelect`). Fires on every map
+	 * tap: the resolved item, or null when nothing selectable was within
+	 * `maxSnapDistance` (the previous selection is cleared). DOM event:
+	 * `mapsdk:locationselect`.
+	 */
+	onLocationSelect: (selection: MapSelection | null) => void;
 	/**
 	 * Error channel. Fires on: mount failure (unsized/unmounted container,
 	 * venue-load rejection), geolocation denial/failure (`cause` carries the
@@ -319,6 +429,43 @@ export interface MapSdkOptions {
 	colleagues?: ColleaguesPlugin;
 	images?: ImageLoaderPlugin;
 	navigation?: NavigationPlugin;
+	/**
+	 * Tap-to-select a space/amenity on the map. `true` = defaults
+	 * (`selectable: ['space', 'amenity']`, pin shown, no distance limit).
+	 * Omitted/false = off (no tap handling, no events, no pin).
+	 */
+	locationSelect?: boolean | LocationSelectOptions;
+	/**
+	 * Render the resource card carousel. Default true. Set false for a
+	 * map-only surface (location pickers, hosts that render their own list);
+	 * pins still render and `resourceselect` still fires on pin taps.
+	 */
+	showCards?: boolean;
+	/**
+	 * Floor strip visibility. 'auto' (default) shows it only when more than
+	 * one floor is listed — the historical behaviour. true always shows it
+	 * (even single-floor); false never does (drive floors via `setFloor`).
+	 */
+	showFloorSelector?: boolean | 'auto';
+	/**
+	 * List EVERY floor of the venue in the floor strip / `getFloors()`, not
+	 * just floors that carry a resource pin. Also allows mounting with no
+	 * `resources` at all (a bare venue browser / location picker). Default
+	 * false. Floors are ordered by Jibestream level/elevation, then mapId.
+	 */
+	allFloors?: boolean;
+	/**
+	 * Floor (Jibestream mapId) to open on. Wins over the focus-resource and
+	 * kiosk floor picks when it is one of the listed floors; ignored
+	 * otherwise. Default: the floor with the most pins (or the venue's first
+	 * listed floor under `allFloors` with no resources).
+	 */
+	initialFloor?: number;
+	/**
+	 * Also mirror every event to `window.postMessage` (iframe / WebView
+	 * hosts). `true` = post to `window.parent` with targetOrigin '*'.
+	 */
+	postMessage?: boolean | PostMessageOptions;
 	strings?: Partial<MapStrings>;
 	theme?: Partial<MapTheme>;
 	logger?: MapLogger;
@@ -346,6 +493,20 @@ export interface IndoorMapHandle {
 	/** Flip a pending/booked state from an async host confirmation. */
 	confirmBooking(id: string | number): void;
 	setFullscreen(fullscreen: boolean): void;
+	/**
+	 * Location-select mode: the current selection (what the last
+	 * `locationselect` event carried), or null. Same payload shape as the
+	 * event — a synchronous "give me the selected item's details" call for
+	 * hosts that don't want to track events.
+	 */
+	getSelection(): MapSelection | null;
+	/** Location-select mode: drop the selection + pin. Emits `locationselect` with null. */
+	clearSelection(): void;
+	/**
+	 * Floors currently listed in the floor strip (all venue floors under
+	 * `allFloors`, else the floors that carry pins). Empty until `ready`.
+	 */
+	getFloors(): FloorSummary[];
 	/**
 	 * Late-arriving config (e.g. floorLabels fetched after mount).
 	 *

@@ -1,0 +1,73 @@
+<!doctype html>
+<!--
+  MyMutual — Building Facilities and Supplies Request: pick the location.
+  MOO-598 (standalone minimap page, Approach 2). Raw HTML + plain JS; the map
+  is the @cxapp-ai/map-sdk IIFE build. The sibling it.html is identical apart
+  from data-ticket / the title — all behaviour lives in ticket-page.js.
+
+  Files this page loads, in order:
+    config.local.js   — Jibestream + ServiceNow settings (gitignored; copy
+                        config.example.js and fill it in)
+    map-sdk.iife.js   — the SDK global (window.MapSDK), from ../../dist after
+                        `npm run build` (copy it next to this file to deploy)
+    ticket-page.js    — page logic
+-->
+<html lang="en" data-ticket="facilities">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+	<title>Facilities Request — Select a location</title>
+	<link rel="stylesheet" href="./ticket-page.css" />
+</head>
+<body>
+	<header class="tp-header">
+		<h1 class="tp-title" id="tp-title">Building Facilities and Supplies Request</h1>
+		<p class="tp-hint" id="tp-hint">Pick the floor, then tap the space or amenity the request is about.</p>
+	</header>
+
+	<!-- The SDK needs a SIZED container at mount; the grid row gives it one. -->
+	<main class="tp-map-wrap">
+		<div id="tp-map" class="tp-map" aria-label="Floor map"></div>
+		<div id="tp-error" class="tp-error" role="alert" hidden></div>
+	</main>
+
+	<form class="tp-sheet" id="tp-form" autocomplete="off">
+		<section class="tp-selection" aria-live="polite">
+			<div class="tp-selection-empty" id="tp-empty">Nothing selected yet — tap a space on the map.</div>
+			<div class="tp-selection-card" id="tp-card" hidden>
+				<div class="tp-selection-kind" id="tp-kind"></div>
+				<div class="tp-selection-name" id="tp-name"></div>
+				<dl class="tp-selection-meta">
+					<div><dt>Floor</dt><dd id="tp-floor">—</dd></div>
+					<div><dt>Space code</dt><dd id="tp-code">—</dd></div>
+				</dl>
+				<button type="button" class="tp-link" id="tp-clear">Clear selection</button>
+			</div>
+			<p class="tp-warning" id="tp-warning" hidden></p>
+		</section>
+
+		<fieldset class="tp-scope">
+			<legend class="tp-scope-legend">Where is the issue?</legend>
+			<label class="tp-radio">
+				<input type="radio" name="scope" value="space" checked />
+				<span>Exactly at the selected space</span>
+			</label>
+			<label class="tp-radio">
+				<input type="radio" name="scope" value="floor" />
+				<span>Anywhere on this floor</span>
+			</label>
+		</fieldset>
+
+		<div class="tp-location">
+			<span class="tp-location-label">Location sent to ServiceNow</span>
+			<code class="tp-location-value" id="tp-location">—</code>
+		</div>
+
+		<button type="submit" class="tp-continue" id="tp-continue" disabled>Continue to ticket</button>
+	</form>
+
+	<script src="./config.local.js"></script>
+	<script src="../../dist/map-sdk.iife.js"></script>
+	<script src="./ticket-page.js"></script>
+</body>
+</html>

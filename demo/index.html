@@ -37,21 +37,6 @@
 			overflow: hidden;
 			background: #fff;
 		}
-		#log {
-			max-width: 960px;
-			height: 180px;
-			overflow-y: auto;
-			margin: 0;
-			padding: 10px;
-			border: 1px solid rgba(0,0,0,0.12);
-			border-radius: 8px;
-			background: #0f172a;
-			color: #a5f3a5;
-			font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-			font-size: 12px;
-			line-height: 1.5;
-			white-space: pre-wrap;
-		}
 	</style>
 </head>
 <body>
@@ -61,10 +46,9 @@
 		<button id="btn-itinerary">Draw itinerary</button>
 		<button id="btn-gps">GPS mock: off</button>
 		<button id="btn-focus">Focus 2nd resource</button>
+		<button id="btn-locsel">Location select: off</button>
 	</div>
 	<div id="map"></div>
-	<h2>mapsdk:* CustomEvent log (listened on the container)</h2>
-	<pre id="log"></pre>
 	<script type="module" src="/main.ts"></script>
 </body>
 </html>
