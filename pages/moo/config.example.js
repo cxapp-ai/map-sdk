@@ -10,13 +10,12 @@
  */
 window.MOO_TICKET_CONFIG = {
 	// ── Jibestream (the map) ──────────────────────────────────────────────
-	// Mutual of Omaha's venue. Get these from Daniel Seijas / Geric Ramos.
-	// The stage venue id seen in the MOO stage config (Apr 2026) was 2754; the
-	// customer id and prod venue id are still to be confirmed.
+	// Mutual of Omaha Headquarters: customer 485, venue 2754. The client id /
+	// secret come from Daniel Seijas — put them ONLY in config.local.js.
 	jibestream: {
 		host: 'https://api.jibestream.com',
-		customerId: 0,
-		venueId: 0,
+		customerId: 485,
+		venueId: 2754,
 		clientId: '',
 		clientSecret: '',
 		// Only if the service account has no default map profile (401 "Map
@@ -26,28 +25,51 @@ window.MOO_TICKET_CONFIG = {
 
 	// Optional: rename floors in the floor strip, by Jibestream mapId.
 	floorLabels: undefined, // e.g. { 7659: 'Floor 44' }
-	// Optional: open on this floor (Jibestream mapId).
+	// Optional: open on this floor (Jibestream mapId). Mutual HQ: 8845 = Floor 1.
 	initialFloor: undefined,
 
 	// ── location_on_floor_plan ────────────────────────────────────────────
-	// Format (confirmed on the MyMutual Ticketing Workflows page):
-	//   "<building>, <floor>, <space code>"  e.g. "HQ, 44, 39E04"
-	//   "<building>, <floor>"                when the user picks "anywhere on this floor"
+	// Format: "<building>, <floor>, <space code>" (comma + space), or
+	// "<building>, <floor>" for "anywhere on this floor" / no code.
+	// Decisions from Frank on MOO-598 (2026-09-24) are the defaults below.
 	building: 'HQ',
-	// Floor component override by Jibestream mapId. Default: the map's numeric
-	// shortName from Jibestream, then its name.
-	floorCodes: undefined, // e.g. { 7659: '44' }
-	// Space component: 'externalId' (Jibestream destination external id — the
-	// venue's space code; default) or 'name' (the display name).
-	spaceCodeSource: 'externalId',
-	// When the tapped item has no code: 'deny' (block Continue and ask for
-	// another space — Frank) or 'name' (fall back to the Jibestream name — Daniel).
-	missingCodePolicy: 'deny',
+
+	// Whole location string from one Jibestream custom property, when the
+	// venue has it configured (Frank). Unset / missing → generated as below.
+	locationProperty: undefined, // e.g. 'Location On Floor Plan'
+
+	// Floor component. 'name' = the Jibestream floor name as-is ("Floor 44" —
+	// Frank's choice); 'shortName' = Floor.shortName ("44", the Confluence
+	// example). floorCodes overrides either, per Jibestream mapId.
+	floorCodeSource: 'name',
+	floorCodes: undefined, // e.g. { 8869: '44' }
+
+	// Space component, first match wins:
+	//   spaceCodeProperty — a Jibestream custom property key (Frank: "space
+	//     code would be a property"). Mutual HQ has none today: 3 of 3826
+	//     destinations carry any property ("Filter Category").
+	//   spaceCodeSource — 'namePrefix' (default: first word of the name when it
+	//     contains a digit — "17N11 Conference" → "17N11"; 3545 of 3826 Mutual
+	//     names follow this), 'externalId' (4 of 3826 at Mutual), or 'name'.
+	spaceCodeProperty: undefined, // e.g. 'Space Code'
+	spaceCodeSource: 'namePrefix',
+	spaceCodePattern: undefined, // regex string, capture group 1 = code (namePrefix only)
+	// No code found: 'floor' (send "<building>, <floor>" — Frank), 'name' (use
+	// the display name as the code), or 'deny' (block Continue).
+	missingCodePolicy: 'floor',
 
 	// What a tap may select: 'space' (rooms/desks/offices — Jibestream
 	// destinations), 'amenity' (POIs), 'waypoint' (any routing point; only
-	// as a last resort). Order = tie-break preference.
+	// as a last resort). Order = tie-break preference. [] = nothing.
 	selectable: ['space', 'amenity'],
+	// Optional filter over candidates — Jibestream doesn't mark rooms vs
+	// desks, so narrow by tags / keywords / name. A rejected candidate is
+	// skipped and the next-nearest accepted one is selected. e.g. rooms only:
+	//   accept: function (c) { return c.kind !== 'space' || c.tags.indexOf('Meeting Room') !== -1; },
+	// c = { kind, mapId, name, externalId, destinationId, amenityId, waypointId, keywords, tags, properties }
+	// e.g. skip corridors at Mutual HQ ("1C03B CIRC"):
+	//   accept: function (c) { return !/\bCIRC\b/.test(c.name || ''); },
+	accept: undefined,
 	// Ignore taps farther than this from any selectable item (map units;
 	// roughly floor-plan pixels). Leave undefined for no limit.
 	maxSnapDistance: undefined,
@@ -56,11 +78,14 @@ window.MOO_TICKET_CONFIG = {
 	keepScopeOnSelect: false,
 
 	// ── ServiceNow (the ticket form) ──────────────────────────────────────
-	// Hosts: mutualofomahadev (STAGE) · mutualofomahatest (PROD-testing) ·
-	// final production host still to be provided by Mutual of Omaha.
-	// sys_ids are the same across environments.
+	// Hosts: mutualofomahadev (STAGE) · mutualofomahatest (what MyMutual PROD
+	// uses today — still Mutual's ServiceNow TEST instance) · final production
+	// host still to be provided by Mutual of Omaha. sys_ids are the same
+	// across environments. Default is the PROD-testing host: per Daniel
+	// (MOO-598) the SSO bypass (`wext=1`, double-auth) only works on PROD, so
+	// the hand-off can only be verified end-to-end there.
 	serviceNow: {
-		host: 'https://mutualofomahadev.service-now.com',
+		host: 'https://mutualofomahatest.service-now.com',
 		pageId: 'my_mutual',
 		locationVariable: 'location_on_floor_plan',
 		// Extra sysparm_variable_values merged into every form (optional).
@@ -77,6 +102,12 @@ window.MOO_TICKET_CONFIG = {
 		},
 	},
 
-	// true = don't navigate on Continue; log + alert the URL instead.
+	// targetOrigin for messages posted to an embedding parent page (the SDK
+	// event mirror + the `continue` hand-off). Set it to the support page's
+	// origin before iframing this picker in production. Default '*'.
+	postMessageTargetOrigin: undefined, // e.g. 'https://mymutual.example.com'
+
+	// true = don't navigate on Continue; log + alert the URL instead (no
+	// `continue` message is posted in dry run).
 	dryRun: false,
 };

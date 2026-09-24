@@ -152,12 +152,17 @@ export function mountIndoorMap(
 		}
 		// Third channel, opt-in: mirror to window.postMessage so an embedding
 		// page (iframe) or a WebView shell can listen without reaching into the
-		// frame's DOM. Structured clone can reject exotic payloads (functions in
-		// bookingContext) — drop that one message, never break the map.
+		// frame's DOM. Resources reach the view through the reactive `props`
+		// bridge, so resource-carrying details (resourceselect, bookrequested,
+		// bookingstatechange, navigaterequested) are Svelte $state PROXIES —
+		// which structured clone rejects. Snapshot to plain data first. A
+		// genuinely non-cloneable payload (a function inside bookingContext)
+		// still throws: drop that one message, never break the map.
 		if (pm && typeof window !== 'undefined') {
 			try {
 				const target = pm.target === 'self' ? window : window.parent;
-				target?.postMessage({ source: 'map-sdk', type: name, detail }, pm.targetOrigin ?? '*');
+				const plain = $state.snapshot(detail);
+				target?.postMessage({ source: 'map-sdk', type: name, detail: plain }, pm.targetOrigin ?? '*');
 			} catch (e) {
 				logger?.warn?.(`[map-sdk] postMessage mirror of "${name}" failed (non-cloneable detail?)`, e);
 			}
@@ -223,6 +228,7 @@ export function mountIndoorMap(
 		locationSelect: options.locationSelect ?? false,
 		showCards: options.showCards ?? true,
 		showFloorSelector: options.showFloorSelector ?? 'auto',
+		floorSelectorStyle: options.floorSelectorStyle ?? 'auto',
 		allFloors: options.allFloors ?? false,
 		initialFloor: options.initialFloor,
 		strings: options.strings,

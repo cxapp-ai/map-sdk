@@ -235,12 +235,32 @@ export interface ItineraryOptions {
  * What a map tap may resolve to.
  *  - 'space'    — a unit/destination (rooms, desks, offices — anything in the
  *                 Jibestream destination index). A tap INSIDE a unit polygon
- *                 wins; otherwise the nearest destination waypoint.
+ *                 wins (the innermost one when polygons nest); otherwise the
+ *                 nearest destination waypoint. Jibestream does not say which
+ *                 destinations are rooms vs desks — narrow with `accept`.
  *  - 'amenity'  — an amenity POI (restrooms, printers, exits, …).
  *  - 'waypoint' — a bare routing waypoint, used only when nothing else is
  *                 selectable near the tap.
  */
 export type SelectableKind = 'space' | 'amenity' | 'waypoint';
+
+/**
+ * A candidate offered to `LocationSelectOptions.accept` — the identifying
+ * subset of `MapSelection`, cheap enough to build for every nearby item.
+ */
+export interface LocationCandidate {
+	kind: SelectableKind;
+	mapId: number;
+	name: string | null;
+	externalId: string | null;
+	destinationId: number | null;
+	amenityId: number | null;
+	waypointId: number | null;
+	keywords: string[];
+	tags: string[];
+	/** Jibestream custom properties (CMS "extensors"), e.g. { "Filter Category": "Office 1" }. */
+	properties: Record<string, unknown>;
+}
 
 /**
  * Opt-in tap-to-select. Off unless configured: with no `locationSelect`
@@ -249,11 +269,20 @@ export type SelectableKind = 'space' | 'amenity' | 'waypoint';
  */
 export interface LocationSelectOptions {
 	/**
-	 * Kinds a tap may resolve to, in preference order for ties. Default
-	 * ['space', 'amenity']. Add 'waypoint' to always get SOMETHING back even
-	 * on a corridor tap far from any POI.
+	 * Kinds a tap may resolve to, in preference order for ties. Omitted →
+	 * ['space', 'amenity']. `[]` → nothing is selectable (every tap emits
+	 * null). Add 'waypoint' to always get SOMETHING back even on a corridor
+	 * tap far from any POI.
 	 */
 	selectable?: SelectableKind[];
+	/**
+	 * Host filter over candidates, applied before "nearest" is decided — a
+	 * rejected candidate is skipped and the next-nearest accepted one wins.
+	 * Use it to split destinations the SDK can't tell apart, e.g. rooms only:
+	 * `accept: (c) => c.kind !== 'space' || c.tags.includes('Meeting Room')`.
+	 * A throwing filter rejects that candidate. Default: accept everything.
+	 */
+	accept?: (candidate: LocationCandidate) => boolean;
 	/**
 	 * Reject candidates farther than this from the tap, in map units
 	 * (Jibestream local space — roughly pixels of the floor SVG; convert with
@@ -274,11 +303,17 @@ export interface MapSelection {
 	kind: SelectableKind;
 	/** Floor the item is on (Jibestream mapId). */
 	mapId: number;
-	/** Floor label as shown in the floor strip (floorLabels override applied). */
+	/**
+	 * Floor label as shown in the floor strip — the CURRENT `floorLabels`
+	 * override applied (including a runtime `update({ provider: { floorLabels } })`).
+	 */
 	floorName: string;
-	/** Jibestream Map.shortName (numeric in JMap, e.g. 44) when present. */
-	floorShortName: number | null;
-	/** Jibestream Map.level when present. */
+	/**
+	 * Jibestream Floor.shortName as configured in the CMS — usually a string
+	 * ("L3", "44", "G"), a number on some payloads. Null when unset.
+	 */
+	floorShortName: string | number | null;
+	/** Jibestream Floor.level (building order) when present. */
 	floorLevel: number | null;
 	venueId: number;
 	/** Item display name (destination/amenity name). Null for bare waypoints. */
@@ -301,16 +336,31 @@ export interface MapSelection {
 	distance: number;
 	keywords: string[];
 	tags: string[];
+	/**
+	 * Every Jibestream custom property of the item (the CMS "extensors" map),
+	 * e.g. { "Filter Category": "Office 1" }. Plain JSON; {} when none. Use
+	 * it to read a venue-specific code (a space-management id) by key.
+	 */
+	properties: Record<string, unknown>;
 	description: string | null;
-	/** JSON exports of the matched Jibestream models (destination / amenity / waypoint / unit meta). */
+	/**
+	 * JSON-safe copies of the matched Jibestream data: `destination` /
+	 * `amenity` / `waypoint` model exports, and for a tap inside a unit
+	 * polygon `unit: { destinationIds, waypointIds, properties }` (the unit
+	 * feature's own properties). Plain data — safe to JSON.stringify, clone
+	 * or mutate; never a live JMap object.
+	 */
 	raw: Record<string, unknown>;
 }
 
 /** One floor of the venue, as listed by `handle.getFloors()`. */
 export interface FloorSummary {
 	mapId: number;
+	/** Label as shown in the floor strip (current floorLabels override applied). */
 	name: string;
-	shortName: number | null;
+	/** Jibestream Floor.shortName — usually a string ("L3", "44"); null when unset. */
+	shortName: string | number | null;
+	/** Jibestream Floor.level (building order) when present. */
 	level: number | null;
 	/** True when at least one of the mounted resources pins on this floor. */
 	hasPins: boolean;
@@ -374,8 +424,11 @@ export interface MapEventCallbacks {
 	/**
 	 * Location-select mode only (`options.locationSelect`). Fires on every map
 	 * tap: the resolved item, or null when nothing selectable was within
-	 * `maxSnapDistance` (the previous selection is cleared). DOM event:
-	 * `mapsdk:locationselect`.
+	 * `maxSnapDistance` (the previous selection is cleared). Also fires null
+	 * whenever the SDK drops an existing selection itself — `clearSelection()`,
+	 * or an engine rebuild (`setResources`, a rebuilding `update()`) — so an
+	 * event-tracking host never holds a selection the map no longer has.
+	 * DOM event: `mapsdk:locationselect`.
 	 */
 	onLocationSelect: (selection: MapSelection | null) => void;
 	/**
@@ -448,17 +501,28 @@ export interface MapSdkOptions {
 	 */
 	showFloorSelector?: boolean | 'auto';
 	/**
-	 * List EVERY floor of the venue in the floor strip / `getFloors()`, not
-	 * just floors that carry a resource pin. Also allows mounting with no
-	 * `resources` at all (a bare venue browser / location picker). Default
-	 * false. Floors are ordered by Jibestream level/elevation, then mapId.
+	 * How floors are picked. 'auto' (default): a tab row for up to 6 floors,
+	 * a compact dropdown (native picker + previous/next buttons) beyond that.
+	 * 'tabs' forces the row (it scrolls sideways when it doesn't fit);
+	 * 'dropdown' forces the picker.
+	 */
+	floorSelectorStyle?: 'auto' | 'tabs' | 'dropdown';
+	/**
+	 * List EVERY building floor of the venue in the floor strip /
+	 * `getFloors()`, not just floors that carry a resource pin (venue-level
+	 * maps that belong to no building floor are left out). Also allows
+	 * mounting with no `resources` at all (a bare venue browser / location
+	 * picker). Default false. Floors are ordered by Jibestream Floor level,
+	 * then elevation, then a numeric shortName, then mapId.
 	 */
 	allFloors?: boolean;
 	/**
-	 * Floor (Jibestream mapId) to open on. Wins over the focus-resource and
-	 * kiosk floor picks when it is one of the listed floors; ignored
-	 * otherwise. Default: the floor with the most pins (or the venue's first
-	 * listed floor under `allFloors` with no resources).
+	 * Floor (Jibestream mapId) to open on, when it is one of the listed
+	 * floors (ignored otherwise). Wins over the kiosk floor pick and over
+	 * `focusResourceId`: a focused resource on another floor is still
+	 * selected (card + `resourceselect`), but the map stays on this floor
+	 * until the user switches. Default: the floor with the most pins (or the
+	 * venue's first listed floor under `allFloors` with no resources).
 	 */
 	initialFloor?: number;
 	/**
@@ -503,8 +567,9 @@ export interface IndoorMapHandle {
 	/** Location-select mode: drop the selection + pin. Emits `locationselect` with null. */
 	clearSelection(): void;
 	/**
-	 * Floors currently listed in the floor strip (all venue floors under
-	 * `allFloors`, else the floors that carry pins). Empty until `ready`.
+	 * Floors currently listed in the floor strip: every building floor under
+	 * `allFloors`; otherwise the floors that carry pins plus the
+	 * `provider.kioskCoordinate` floor when one is set. Empty until `ready`.
 	 */
 	getFloors(): FloorSummary[];
 	/**

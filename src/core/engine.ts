@@ -30,6 +30,7 @@ import type {
 	ColleagueBooking,
 	MapLogger,
 	FloorSummary,
+	LocationCandidate,
 	MapSelection,
 	SelectableKind,
 } from '../types.js';
@@ -737,16 +738,22 @@ export interface MinimapInstance {
 	onTap: (cb: (tap: { worldX: number; worldY: number; mapId: number }) => void) => () => void;
 	/**
 	 * Resolve a world point on a floor to the selectable item at/nearest it:
-	 *   1. a unit polygon containing the point → that space (distance 0);
+	 *   1. the innermost unit polygon containing the point that resolves to a
+	 *      destination → that space (distance 0);
 	 *   2. the nearest destination/amenity waypoint among `selectable` kinds
 	 *      (ties break by `selectable` order);
 	 *   3. the nearest bare waypoint, only if 'waypoint' is selectable.
-	 * Null when nothing qualifies within `maxSnapDistance` (map units).
-	 * Default selectable: ['space', 'amenity'].
+	 * `accept` filters candidates at every step (rejected ones are skipped, the
+	 * next-best is used). Null when nothing qualifies within `maxSnapDistance`
+	 * (map units). `selectable` omitted → ['space', 'amenity']; [] → always null.
 	 */
 	resolveLocation: (
 		world: { worldX: number; worldY: number; mapId: number },
-		opts?: { selectable?: SelectableKind[]; maxSnapDistance?: number },
+		opts?: {
+			selectable?: SelectableKind[];
+			maxSnapDistance?: number;
+			accept?: (candidate: LocationCandidate) => boolean;
+		},
 	) => MapSelection | null;
 	/** Viewport pixel → world coord on the current floor (inverse of projectWorldToViewport). */
 	viewportToWorld: (x: number, y: number) => { worldX: number; worldY: number; mapId: number } | null;
@@ -1011,12 +1018,21 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 
 	// Floor labels live on the JMap FLOOR model (name / shortName / level /
 	// elevation) — the Map model only carries geometry (width, height, svg…).
-	// Resolve through buildings.getFloorByMap(map). NOTE: JMap types
-	// Floor.shortName as Number and silently drops a string value from the
-	// CMS, so shortName can be null even when the venue has one configured.
-	type FloorMeta = { name: string | null; shortName: number | null; level: number | null; elevation: number | null };
+	// Resolve through buildings.getFloorByMap(map). shortName is whatever the
+	// JACS payload carried — usually a string from the CMS ("L3", "44", "G").
+	// JMap's Floor setter is typed Number, but the model constructor copies
+	// the raw payload into its `_` bag without calling setters, so the getter
+	// returns the string unchanged; accept both types here.
+	type FloorMeta = {
+		name: string | null;
+		shortName: string | number | null;
+		level: number | null;
+		elevation: number | null;
+		/** False when the map belongs to no building floor (e.g. a venue-level map). */
+		isFloor: boolean;
+	};
 	function floorMeta(mapId: number): FloorMeta {
-		const out: FloorMeta = { name: null, shortName: null, level: null, elevation: null };
+		const out: FloorMeta = { name: null, shortName: null, level: null, elevation: null, isFloor: false };
 		const mapObj = mapsColl?.getById?.(mapId);
 		if (!mapObj) return out;
 		try {
@@ -1025,8 +1041,10 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 				| null
 				| undefined;
 			if (fl) {
+				out.isFloor = true;
 				if (typeof fl.name === 'string' && fl.name) out.name = fl.name;
-				if (typeof fl.shortName === 'number') out.shortName = fl.shortName;
+				if (typeof fl.shortName === 'number' && Number.isFinite(fl.shortName)) out.shortName = fl.shortName;
+				else if (typeof fl.shortName === 'string' && fl.shortName.trim()) out.shortName = fl.shortName.trim();
 				if (typeof fl.level === 'number') out.level = fl.level;
 				if (typeof fl.elevation === 'number') out.elevation = fl.elevation;
 			}
@@ -1036,7 +1054,7 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		return out;
 	}
 	// Display label for a floor from JMap data alone (no host override):
-	// Floor.name, then its numeric shortName, then the raw id as a last resort.
+	// Floor.name, then its shortName, then the raw id as a last resort.
 	function floorBaseName(mapId: number): string {
 		const fm = floorMeta(mapId);
 		return fm.name ?? (fm.shortName != null ? String(fm.shortName) : `Floor ${mapId}`);
@@ -1054,11 +1072,15 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		const resourceFloor = g.items.find(it => !!it.res.floorName)?.res.floorName;
 		// The Map model carries no name in practice (floor labels are on the
 		// Floor model — see floorMeta); the Map probes are kept for parity with
-		// older payloads, the Floor model is the real source.
+		// older payloads. Legacy mounts keep the host's own resource floorName
+		// ahead of the Floor model (unchanged behaviour: it only replaces the
+		// raw "Floor <id>" fallback). Under allFloors the Floor model comes
+		// first so pin floors and pin-less floors are labelled the same way.
 		const fm = floorMeta(g.mapId);
-		g.mapName = m?.name || m?.shortName || m?.floorName || fm.name
-			|| (fm.shortName != null ? String(fm.shortName) : '')
-			|| resourceFloor || `Floor ${g.mapId}`;
+		const jmapFloorName = fm.name || (fm.shortName != null ? String(fm.shortName) : '');
+		g.mapName = m?.name || m?.shortName || m?.floorName
+			|| (opts.allFloors ? (jmapFloorName || resourceFloor) : (resourceFloor || jmapFloorName))
+			|| `Floor ${g.mapId}`;
 		// Host-supplied floor label overrides (e.g. { 7659: 'Floor 1', 8837: 'Floor 2' }).
 		// Takes precedence over all JMap-derived names so venue-specific map IDs
 		// never appear in the UI.
@@ -1143,15 +1165,51 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	// ones carrying pins, in building order (level/elevation) — what a floor
 	// selector wants. Without the flag keep the historical pins-desc order.
 	if (opts.allFloors) {
+		// Only maps that belong to a building floor: `activeVenue.maps` can also
+		// hold a venue-level map (populate.venue creates one when the venue
+		// payload carries a `map`), which is not a floor and must not become a
+		// floor chip. If the buildings collection can't answer (older jmap
+		// builds without getFloorByMap), fall back to listing every map.
+		const canTellFloors = typeof buildingsColl?.getFloorByMap === 'function';
 		for (const m of (mapsColl?.getAll?.() ?? []) as Array<{ id?: number }>) {
 			if (typeof m.id !== 'number' || floors.some(f => f.mapId === m.id)) continue;
+			if (canTellFloors && !floorMeta(m.id).isFloor) continue;
 			floors.push({ mapId: m.id, mapName: cfg.floorLabels?.[m.id] ?? floorBaseName(m.id), pins: [] });
 		}
-		const order = (mapId: number): number => {
-			const fm = floorMeta(mapId);
-			return fm.level ?? fm.elevation ?? fm.shortName ?? mapId;
+		// Building order. Every floor must be keyed from the SAME source or
+		// the keys aren't comparable (a numeric shortName "2" vs a mapId 100
+		// would put ground floor "G" after "2"). Use the first source that
+		// ALL listed floors have: level, then elevation, then a numeric
+		// shortName ("44" → 44; "L3"/"G" are not orderable), else the mapId.
+		// Only REAL building floors take part in choosing the key: a pin or
+		// kiosk floor kept from a non-floor map has no level, and letting it
+		// veto 'level' would drop the whole list to mapId order. Such maps
+		// sort after every building floor, by mapId.
+		const metas = new Map(floors.map(f => [f.mapId, floorMeta(f.mapId)] as const));
+		const buildingFloors = [...metas.values()].filter(fm => fm.isFloor || !canTellFloors);
+		const numericShort = (fm: FloorMeta): number | null => {
+			const n = fm.shortName != null ? Number(fm.shortName) : NaN;
+			return Number.isFinite(n) ? n : null;
 		};
-		floors.sort((a, b) => (order(a.mapId) - order(b.mapId)) || (a.mapId - b.mapId));
+		const sources: Array<(fm: FloorMeta) => number | null> = [
+			(fm) => fm.level,
+			(fm) => fm.elevation,
+			numericShort,
+		];
+		const keyOf = buildingFloors.length > 0
+			? sources.find(src => buildingFloors.every(fm => src(fm) != null))
+			: undefined;
+		const rank = (mapId: number): [number, number] => {
+			const fm = metas.get(mapId);
+			const onFloor = !!fm && (fm.isFloor || !canTellFloors);
+			if (!onFloor) return [1, mapId];
+			return [0, (keyOf && fm ? keyOf(fm) : null) ?? mapId];
+		};
+		floors.sort((a, b) => {
+			const [ga, ka] = rank(a.mapId);
+			const [gb, kb] = rank(b.mapId);
+			return (ga - gb) || (ka - kb) || (a.mapId - b.mapId);
+		});
 	} else {
 		floors.sort((a, b) => (b.pins.length - a.pins.length) || (a.mapId - b.mapId));
 	}
@@ -2102,18 +2160,52 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		}
 	}
 
+	// JSON-safe deep copy (drops functions / cycles by failing to null). Every
+	// value placed in MapSelection.raw goes through this, so a selection can be
+	// JSON.stringify'd, structured-cloned (postMessage) and mutated by the host
+	// without touching JMap's live objects.
+	function jsonClone(v: unknown): unknown {
+		if (v == null || typeof v !== 'object') return v ?? null;
+		try { return JSON.parse(JSON.stringify(v)); } catch { return null; }
+	}
+
 	// JSON snapshot of a JMap model: its export() when available, else the raw
 	// `_` payload bag. Null for non-objects / non-serialisable values.
 	function exportModel(m: unknown): Record<string, unknown> | null {
 		if (!m || typeof m !== 'object') return null;
 		const mm = m as JModel;
 		try {
-			if (typeof mm.export === 'function') return mm.export() as Record<string, unknown>;
+			if (typeof mm.export === 'function') return jsonClone(mm.export()) as Record<string, unknown> | null;
 		} catch { /* fall through to the raw bag */ }
-		if (mm._ && typeof mm._ === 'object') {
-			try { return JSON.parse(JSON.stringify(mm._)) as Record<string, unknown>; } catch { return null; }
-		}
+		if (mm._ && typeof mm._ === 'object') return jsonClone(mm._) as Record<string, unknown> | null;
 		return null;
+	}
+
+	// A unit shape's meta is JMap's LIVE object (it back-references the shape's
+	// geojson feature and style, and is circular), so never expose it directly:
+	// copy the ids plus the feature's own properties.
+	function exportUnitMeta(meta: unknown): Record<string, unknown> | null {
+		if (!meta || typeof meta !== 'object') return null;
+		const m = meta as { destinationIds?: unknown; waypointIds?: unknown; sourceData?: { properties?: unknown } };
+		return {
+			destinationIds: Array.isArray(m.destinationIds) ? m.destinationIds.filter(n => typeof n === 'number') : [],
+			waypointIds: Array.isArray(m.waypointIds) ? m.waypointIds.filter(n => typeof n === 'number') : [],
+			properties: jsonClone(m.sourceData?.properties ?? null),
+		};
+	}
+
+	// Shoelace polygon area (absolute), for picking the innermost of several
+	// containing unit polygons.
+	function polygonArea(poly: unknown): number {
+		if (!Array.isArray(poly) || poly.length < 3) return Infinity;
+		let sum = 0;
+		for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+			const a = readPoint(poly[i]);
+			const b = readPoint(poly[j]);
+			if (!a || !b) return Infinity;
+			sum += (b.x + a.x) * (b.y - a.y);
+		}
+		return Math.abs(sum) / 2;
 	}
 
 	// Destination/amenity `locations` is a JMap collection in v4 (getAll()),
@@ -2179,6 +2271,34 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		return out;
 	}
 
+	// Jibestream custom properties of a destination/amenity — the CMS
+	// "extensors" map ({ "Filter Category": "Office 1", … }), read from the raw
+	// payload bag. Always a fresh JSON-safe object ({} when none).
+	function modelProperties(model: JModel | null): Record<string, unknown> {
+		const bag = model?._ as { extensors?: unknown; destinationExtensors?: unknown } | undefined;
+		const ext = bag?.extensors ?? bag?.destinationExtensors;
+		if (!ext || typeof ext !== 'object' || Array.isArray(ext)) return {};
+		return (jsonClone(ext) as Record<string, unknown> | null) ?? {};
+	}
+
+	// Lightweight view of a candidate for the host's `accept` filter — cheap to
+	// build per candidate (no model exports), same field semantics as MapSelection.
+	function describeCandidate(kind: SelectableKind, mapId: number, model: JModel | null, wp: JWaypoint | null): LocationCandidate {
+		const isAmenity = kind === 'amenity';
+		return {
+			kind,
+			mapId,
+			name: model?.name ?? null,
+			externalId: model?.externalId != null && model.externalId !== '' ? String(model.externalId) : null,
+			destinationId: !isAmenity && typeof model?.id === 'number' ? model.id : null,
+			amenityId: isAmenity && typeof model?.id === 'number' ? model.id : null,
+			waypointId: typeof wp?.id === 'number' ? wp.id : null,
+			keywords: Array.isArray(model?.keywords) ? model.keywords.map(String) : [],
+			tags: Array.isArray(model?.tags) ? model.tags.map(String) : [],
+			properties: modelProperties(model),
+		};
+	}
+
 	function buildSelection(
 		kind: SelectableKind,
 		world: TapPoint,
@@ -2192,7 +2312,7 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		const raw: Record<string, unknown> = {};
 		if (model) raw[isAmenity ? 'amenity' : 'destination'] = exportModel(model);
 		if (item.wp) raw.waypoint = exportModel(item.wp);
-		if (item.unitMeta) raw.unit = item.unitMeta;
+		if (item.unitMeta) raw.unit = exportUnitMeta(item.unitMeta);
 		return {
 			kind,
 			mapId: world.mapId,
@@ -2212,6 +2332,7 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 			distance,
 			keywords: Array.isArray(model?.keywords) ? model.keywords.map(String) : [],
 			tags: Array.isArray(model?.tags) ? model.tags.map(String) : [],
+			properties: modelProperties(model),
 			description: model?.description ?? null,
 			raw,
 		};
@@ -2219,32 +2340,57 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 
 	function resolveLocation(
 		world: TapPoint,
-		ropts: { selectable?: SelectableKind[]; maxSnapDistance?: number } = {},
+		ropts: {
+			selectable?: SelectableKind[];
+			maxSnapDistance?: number;
+			accept?: (c: LocationCandidate) => boolean;
+		} = {},
 	): MapSelection | null {
-		const selectable: SelectableKind[] = ropts.selectable && ropts.selectable.length > 0
-			? ropts.selectable
-			: ['space', 'amenity'];
+		// Omitted → default kinds. An explicit [] means "nothing is selectable"
+		// (every tap resolves to null), not "use the default".
+		const selectable: SelectableKind[] = ropts.selectable ?? ['space', 'amenity'];
+		if (selectable.length === 0) return null;
 		const maxD = ropts.maxSnapDistance ?? Infinity;
 		const mapObj = mapsColl?.getById?.(world.mapId);
 		if (!mapObj) return null;
 		const tap = { x: world.worldX, y: world.worldY };
+		// Host filter (e.g. rooms-only via tags/keywords). A throwing filter
+		// rejects that candidate rather than breaking the tap.
+		const accepts = (kind: SelectableKind, model: JModel | null, wp: JWaypoint | null): boolean => {
+			if (!ropts.accept) return true;
+			try { return !!ropts.accept(describeCandidate(kind, world.mapId, model, wp)); }
+			catch (e) { jibLog('minimap', 'locationSelect.accept threw', e); return false; }
+		};
 
-		// 1. Tap inside a unit polygon → that space. Units with neither a
-		//    destination nor a waypoint (unassigned floor area) are skipped.
+		// 1. Tap inside a unit polygon → that space, distance 0. When polygons
+		//    nest (a desk drawn inside an open-office unit) the INNERMOST
+		//    (smallest-area) containing unit wins. A unit is only a candidate
+		//    when it resolves to a named destination — via its destinationIds,
+		//    or, for waypoint-only units, via the destination whose location
+		//    lists that waypoint. Unassigned floor area / unresolvable units are
+		//    skipped so the nearest real destination (step 2) wins instead.
 		if (selectable.includes('space') && typeof control.getUnitsFromMap === 'function') {
 			let units: unknown[] = [];
 			try { units = control.getUnitsFromMap(mapObj) ?? []; }
 			catch (e) { jibLog('minimap', 'getUnitsFromMap threw', e); }
+			let hit: { model: JModel; wp: JWaypoint | null; unit: unknown; meta: unknown; area: number } | null = null;
 			for (const u of units) {
 				const shape = u as { points?: unknown; meta?: { destinationIds?: number[]; waypointIds?: number[] } };
 				if (!pointInPolygon(tap, shape.points)) continue;
 				const destId = shape.meta?.destinationIds?.[0];
 				const wpId = shape.meta?.waypointIds?.[0];
-				if (destId == null && wpId == null) continue;
-				const model = destId != null ? ((destColl?.getById?.(destId) as JModel | undefined) ?? null) : null;
 				const wp = wpId != null ? waypointOnMap(mapObj, wpId) : null;
-				const c = (wp ? readWaypointCoord(wp) : null) ?? unitCenterFromPoints(u) ?? tap;
-				return buildSelection('space', world, { model, wp, x: c.x, y: c.y, unitMeta: shape.meta ?? null }, 0);
+				let model: JModel | null = destId != null ? ((destColl?.getById?.(destId) as JModel | undefined) ?? null) : null;
+				if (!model && wpId != null) {
+					model = candidatesOn(world.mapId).find(c => c.kind === 'space' && c.wp.id === wpId)?.model ?? null;
+				}
+				if (!model || !accepts('space', model, wp)) continue;
+				const area = polygonArea(shape.points);
+				if (!hit || area < hit.area) hit = { model, wp, unit: u, meta: shape.meta ?? null, area };
+			}
+			if (hit) {
+				const c = (hit.wp ? readWaypointCoord(hit.wp) : null) ?? unitCenterFromPoints(hit.unit) ?? tap;
+				return buildSelection('space', world, { model: hit.model, wp: hit.wp, x: c.x, y: c.y, unitMeta: hit.meta }, 0);
 			}
 		}
 
@@ -2256,7 +2402,9 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 			const d = Math.hypot(c.x - tap.x, c.y - tap.y);
 			const wins = d < bestD
 				|| (d === bestD && best != null && selectable.indexOf(c.kind) < selectable.indexOf(best.kind));
-			if (wins) { best = c; bestD = d; }
+			if (!wins || !accepts(c.kind, c.model, c.wp)) continue;
+			best = c;
+			bestD = d;
 		}
 		if (best && bestD <= maxD) return buildSelection(best.kind, world, best, bestD);
 
@@ -2264,7 +2412,7 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		if (selectable.includes('waypoint')) {
 			const wp = resolveCoordinateWaypoint({ mapId: world.mapId, x: tap.x, y: tap.y }) as JWaypoint | null;
 			const c = wp ? readWaypointCoord(wp) : null;
-			if (wp && c) {
+			if (wp && c && accepts('waypoint', null, wp)) {
 				const d = Math.hypot(c.x - tap.x, c.y - tap.y);
 				if (d <= maxD) return buildSelection('waypoint', world, { model: null, wp, x: c.x, y: c.y }, d);
 			}

@@ -154,6 +154,8 @@
 		showCards?: boolean;
 		/** Floor strip: 'auto' (>1 floor, historical), true (always), false (never). */
 		showFloorSelector?: boolean | 'auto';
+		/** Floor selector look: 'auto' (tabs ≤ 6 floors, dropdown beyond), 'tabs', 'dropdown'. */
+		floorSelectorStyle?: 'auto' | 'tabs' | 'dropdown';
 		/** List every venue floor + allow an empty resource set (engine allFloors). */
 		allFloors?: boolean;
 		/** Floor (mapId) to open on, when it is one of the listed floors. */
@@ -187,6 +189,7 @@
 		locationSelect = false,
 		showCards = true,
 		showFloorSelector = 'auto',
+		floorSelectorStyle = 'auto',
 		allFloors = false,
 		// Renamed: the mount effect has a local `initialFloor` for its floor pick.
 		initialFloor: initialFloorProp,
@@ -560,12 +563,17 @@
 				instanceVersion++;
 				floors = inst.state.floors;
 				unresolved = inst.state.unresolved;
+				// True when the host's `initialFloor` decided the opening floor —
+				// the mount-time auto-select below must then not move the map off
+				// it (a focused resource on another floor is selected in place).
+				let honourInitialFloor = false;
 				if (selectedMapId == null) {
 					let initialFloor: number | null = null;
 					// Host-requested opening floor wins when it is a listed floor.
 					const wanted = untrack(() => initialFloorProp);
 					if (wanted != null && inst.state.floors.some(f => f.mapId === wanted)) {
 						initialFloor = wanted;
+						honourInitialFloor = true;
 					}
 					const focusId = untrack(() => activeFocusId);
 					if (initialFloor == null && focusId !== undefined) {
@@ -617,7 +625,7 @@
 					// otherwise bail because selectedPin is now set. So when already
 					// selected, just re-attempt the scroll: by the retry the refs
 					// are bound and the focused card finally centres.
-					if (!selectedPin) selectByExternalId(focusId, { scroll: true });
+					if (!selectedPin) selectByExternalId(focusId, { scroll: true, switchFloor: !honourInitialFloor });
 					else scrollCarouselToExternalId(focusId);
 				};
 				autoSelect();
@@ -716,10 +724,7 @@
 			unregisterTap?.();
 			unregisterTap = null;
 			if (on && mm) unregisterTap = mm.onTap(handleMapTap);
-			if (!on && selection) {
-				selection = null;
-				selectionPos = null;
-			}
+			if (!on) dropSelection();
 		});
 	});
 
@@ -1230,10 +1235,12 @@
 	// effect, then re-centres the live map on the pin once the switch lands.
 	// `opts.scroll` controls whether to programmatically scroll the carousel to
 	// the selected card (true when triggered by a pin click; false when the
-	// user is already mid-scroll on the carousel itself).
+	// user is already mid-scroll on the carousel itself). `opts.switchFloor:
+	// false` selects without moving the map to the pin's floor (the mount-time
+	// focus under a host `initialFloor`); the pin shows once the user switches.
 	function selectByExternalId(
 		extId: string | number | undefined | null,
-		opts: { scroll?: boolean } = {},
+		opts: { scroll?: boolean; switchFloor?: boolean } = {},
 	): void {
 		const found = pinForExternalId(extId);
 		if (!found) {
@@ -1247,7 +1254,9 @@
 		selectedPin = found.pin;
 		emit('resourceselect', found.pin.resource);
 		const needsFloorSwitch = found.mapId !== selectedMapId;
-		if (needsFloorSwitch) {
+		if (needsFloorSwitch && opts.switchFloor === false) {
+			// Stay on the current floor; nothing to recenter on here.
+		} else if (needsFloorSwitch) {
 			// Defer the recenter to the floor-switch effect's `.finally`; it
 			// awaits setFloor and reframes the floor first.
 			pendingRecenterAfterSwitch = true;
@@ -1588,10 +1597,11 @@
 		selectedMapId = null;
 		selectedPin = null;
 		// The controller (and its tap slot) is gone with the instance; the
-		// selection was resolved against that venue/floor set, so drop it too.
+		// selection was resolved against that venue/floor set, so drop it too
+		// — and tell the host, which may be tracking it from events. (On a
+		// real destroy the mount layer has already squelched emits.)
 		unregisterTap = null;
-		selection = null;
-		selectionPos = null;
+		dropSelection();
 		load = 'idle';
 		loadError = null;
 		bookingState = { status: 'idle' };
@@ -1905,6 +1915,28 @@
 			: showFloorSelector === false ? false
 				: floors.length > 1,
 	);
+	// 'auto': tabs while they reasonably fit a phone row, a compact dropdown
+	// beyond that (a 32-floor tower as tabs is unusable even when scrollable).
+	const FLOOR_TABS_MAX = 6;
+	const useFloorDropdown = $derived(
+		floorSelectorStyle === 'dropdown'
+			|| (floorSelectorStyle !== 'tabs' && floors.length > FLOOR_TABS_MAX),
+	);
+
+	// Tab row: keep the active tab in view when the row scrolls (a floor
+	// picked via setFloor / a cross-floor selection may sit off-screen).
+	let floorStripEl: HTMLDivElement | undefined = $state();
+	$effect(() => {
+		const el = floorStripEl;
+		const id = selectedMapId;
+		void floors.length;
+		if (!el || id == null || el.scrollWidth <= el.clientWidth) return;
+		const idx = untrack(() => floors.findIndex(f => f.mapId === id));
+		const tab = idx >= 0 ? (el.children[idx] as HTMLElement | undefined) : undefined;
+		if (!tab) return;
+		const left = tab.offsetLeft - (el.clientWidth - tab.offsetWidth) / 2;
+		el.scrollTo({ left: Math.max(0, left), behavior: 'smooth' });
+	});
 
 	// Route active → native dot drives the auto-reroute move event; suppress the
 	// HTML overlay dot so it's not doubled (useNativeUserDot's compare-double stays).
@@ -1940,6 +1972,24 @@
 		return inst.projectWorldToViewport(sel.worldX, sel.worldY);
 	}
 
+	// The engine bakes floor labels at build time; a runtime
+	// update({ provider: { floorLabels } }) renames floors in place (strip +
+	// getFloors()), so apply the CURRENT override on the way out too. Returns
+	// a fresh object, so the stored snapshot is never mutated.
+	function withCurrentLabels(sel: MapSelection | null): MapSelection | null {
+		if (!sel) return null;
+		const label = untrack(() => provider.floorLabels?.[sel.mapId]);
+		return label && label !== sel.floorName ? { ...sel, floorName: label } : sel;
+	}
+
+	// Drop the selection + pin; notify the host only if there was one.
+	function dropSelection(): void {
+		const had = untrack(() => selection) != null;
+		selection = null;
+		selectionPos = null;
+		if (had) untrack(() => emit('locationselect', null));
+	}
+
 	function handleMapTap(tap: { worldX: number; worldY: number; mapId: number }): void {
 		const inst = mm;
 		const opts = untrack(() => locSel);
@@ -1950,23 +2000,21 @@
 		const next = inst.resolveLocation(tap, {
 			selectable: opts.selectable,
 			maxSnapDistance: opts.maxSnapDistance,
+			accept: opts.accept,
 		});
 		selection = next;
 		selectionPos = projectSelection(inst);
-		emit('locationselect', next);
+		emit('locationselect', withCurrentLabels(next));
 	}
 
 	/** Location-select: the current selection, or null. */
 	export function getSelection(): MapSelection | null {
-		return selection;
+		return withCurrentLabels(selection);
 	}
 
 	/** Location-select: drop the selection + pin; emits locationselect(null). */
 	export function clearSelection(): void {
-		if (!selection) return;
-		selection = null;
-		selectionPos = null;
-		emit('locationselect', null);
+		dropSelection();
 	}
 
 	/** Listed floors, with any runtime floorLabels override applied. */
@@ -2148,19 +2196,65 @@
 {/snippet}
 
 {#snippet floorStrip()}
-	<div class="rm-floor-select">
-		{#each floors as f (f.mapId)}
+	{#if useFloorDropdown}
+		<!-- Many floors (e.g. a 32-floor tower): a compact picker instead of a
+		     tab row that can't fit. Native <select> = the OS picker on phones.
+		     Prev/next step one floor in list order (building order under
+		     allFloors). -->
+		{@const idx = floors.findIndex(f => f.mapId === selectedMapId)}
+		<div class="rm-floor-select rm-floor-select-dropdown">
 			<button
 				type="button"
-				class="rm-floor-tab"
-				class:rm-floor-tab-active={f.mapId === selectedMapId}
-				onclick={() => pickFloor(f.mapId)}
-				aria-pressed={f.mapId === selectedMapId}
+				class="rm-floor-step"
+				aria-label={t.previousFloor}
+				disabled={idx <= 0}
+				onclick={() => { if (idx > 0) pickFloor(floors[idx - 1].mapId); }}
 			>
-				{floorLabel(f)}
+				<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
 			</button>
-		{/each}
-	</div>
+			<label class="rm-floor-picker">
+				<span class="rm-floor-picker-label">{t.floorSelectLabel}</span>
+				<select
+					class="rm-floor-picker-select"
+					value={selectedMapId ?? ''}
+					onchange={(e) => {
+						const id = Number((e.currentTarget as HTMLSelectElement).value);
+						if (Number.isFinite(id)) pickFloor(id);
+					}}
+				>
+					{#each floors as f (f.mapId)}
+						<option value={f.mapId}>{floorLabel(f)}</option>
+					{/each}
+				</select>
+				<svg class="rm-floor-picker-caret" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+			</label>
+			<button
+				type="button"
+				class="rm-floor-step"
+				aria-label={t.nextFloor}
+				disabled={idx < 0 || idx >= floors.length - 1}
+				onclick={() => { if (idx >= 0 && idx < floors.length - 1) pickFloor(floors[idx + 1].mapId); }}
+			>
+				<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>
+			</button>
+		</div>
+	{:else}
+		<!-- Tab row. Scrolls horizontally when the tabs don't fit (a narrow
+		     phone, long floor names); the active tab is kept in view. -->
+		<div class="rm-floor-select" bind:this={floorStripEl}>
+			{#each floors as f (f.mapId)}
+				<button
+					type="button"
+					class="rm-floor-tab"
+					class:rm-floor-tab-active={f.mapId === selectedMapId}
+					onclick={() => pickFloor(f.mapId)}
+					aria-pressed={f.mapId === selectedMapId}
+				>
+					{floorLabel(f)}
+				</button>
+			{/each}
+		</div>
+	{/if}
 {/snippet}
 
 {#snippet resourceCarousel()}
@@ -2526,9 +2620,18 @@
 		position: relative;
 		z-index: 11;
 		background: #fff;
+		/* Tabs that don't fit scroll sideways instead of being clipped (they
+		   were unreachable past the viewport edge). */
+		overflow-x: auto;
+		overscroll-behavior-inline: contain;
+		scrollbar-width: none;
+		-webkit-overflow-scrolling: touch;
 	}
+	.rm-floor-select::-webkit-scrollbar { display: none; }
 	.rm-floor-tab {
-		flex: 1;
+		/* Grow to share the row when they fit; never shrink below the label. */
+		flex: 1 0 auto;
+		white-space: nowrap;
 		min-height: 36px;
 		display: inline-flex;
 		align-items: center;
@@ -2559,6 +2662,82 @@
 	.rm-floor-tab:focus-visible {
 		outline: 2px solid var(--map-primary, #6366f1);
 		outline-offset: 2px;
+	}
+
+	/* Dropdown floor picker (many floors): [‹] [Floor ▾ Floor 44] [›] */
+	.rm-floor-select-dropdown {
+		gap: 8px;
+		overflow: visible;
+	}
+	.rm-floor-step {
+		flex: 0 0 auto;
+		width: 40px;
+		height: 40px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border-radius: 8px;
+		border: 1px solid var(--map-border, rgba(0,0,0,0.1));
+		background: transparent;
+		color: var(--map-text, #0f172a);
+		cursor: pointer;
+		-webkit-tap-highlight-color: transparent;
+		touch-action: manipulation;
+	}
+	.rm-floor-step:hover:not(:disabled) { background: var(--map-surface, rgba(0,0,0,0.04)); }
+	.rm-floor-step:disabled { opacity: 0.35; cursor: default; }
+	.rm-floor-step:focus-visible {
+		outline: 2px solid var(--map-primary, #6366f1);
+		outline-offset: 2px;
+	}
+	.rm-floor-picker {
+		position: relative;
+		flex: 1 1 auto;
+		min-width: 0;
+		display: flex;
+		align-items: center;
+		height: 40px;
+		border-radius: 8px;
+		border: 1px solid var(--map-primary, #6366f1);
+		background: #fff;
+	}
+	.rm-floor-picker-label {
+		flex: 0 0 auto;
+		padding-left: 12px;
+		font-size: 12px;
+		font-weight: 600;
+		letter-spacing: 0.02em;
+		text-transform: uppercase;
+		color: var(--map-text-muted, #64748b);
+		pointer-events: none;
+	}
+	.rm-floor-picker-select {
+		flex: 1 1 auto;
+		min-width: 0;
+		height: 100%;
+		/* Native control, restyled: the OS picker opens on tap (phones). */
+		appearance: none;
+		-webkit-appearance: none;
+		border: none;
+		background: transparent;
+		padding: 0 34px 0 8px;
+		font: inherit;
+		font-size: 15px;
+		font-weight: 600;
+		color: var(--map-text, #0f172a);
+		cursor: pointer;
+		text-overflow: ellipsis;
+	}
+	.rm-floor-picker-select:focus-visible { outline: none; }
+	.rm-floor-picker:focus-within {
+		outline: 2px solid var(--map-primary, #6366f1);
+		outline-offset: 2px;
+	}
+	.rm-floor-picker-caret {
+		position: absolute;
+		right: 10px;
+		color: var(--map-text-muted, #64748b);
+		pointer-events: none;
 	}
 
 	.rm-loading-overlay {

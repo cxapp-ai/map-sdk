@@ -27,4 +27,13 @@ export default defineConfig({
 		port: 4310,
 		strictPort: true,
 	},
+	// This server never builds. With the defaults (outDir 'dist' under the
+	// repo root + emptyOutDir) vite's file watcher IGNORES dist/, so after
+	// `npm run build` the pages kept getting a stale, cached copy of
+	// dist/map-sdk.iife.js until the server restarted. emptyOutDir:false
+	// takes dist/ out of the watcher's ignore list, so a rebuild is picked
+	// up on the next reload.
+	build: {
+		emptyOutDir: false,
+	},
 });
