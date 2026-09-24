@@ -94,7 +94,17 @@ body {
 	gap: 12px;
 }
 
+/* Same height empty or filled: the sheet sits under the map in the grid,
+   so a sheet that grows on the first tap would shrink the map, and the SDK
+   re-frames (re-zooms) the floor on every resize. */
+.tp-selection-empty,
+.tp-selection-card {
+	min-height: 88px;
+}
 .tp-selection-empty {
+	display: flex;
+	align-items: center;
+	justify-content: center;
 	font-size: 14px;
 	color: var(--tp-muted);
 	padding: 10px 12px;

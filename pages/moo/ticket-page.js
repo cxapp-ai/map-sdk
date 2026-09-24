@@ -20,13 +20,39 @@
 (function () {
 	'use strict';
 
-	var CFG = window.MOO_TICKET_CONFIG;
+	// Defaults live HERE only; config.local.js overrides them (an explicit
+	// `undefined` in the config means "use the default").
+	//   floorCodeSource 'name', missingCodePolicy 'floor' — Frank, MOO-598
+	//     2026-09-24 (floor name; no code → floor only).
+	//   spaceCodeSource 'namePrefix' — OUR choice, pending Frank's OK: he
+	//     asked for a property, but Mutual HQ has no code property (3 of 3826
+	//     destinations carry any property), while 3824 of 3826 names start
+	//     with the code. Set spaceCodeProperty when one exists, and
+	//     spaceCodeSource 'none' to stop deriving codes from names.
+	var DEFAULTS = {
+		building: 'HQ',
+		floorCodeSource: 'name',
+		spaceCodeSource: 'namePrefix',
+		missingCodePolicy: 'floor',
+		selectable: ['space', 'amenity', 'point'],
+		maxSnapMeters: 15,
+		postMessageTargetOrigin: '*',
+	};
+	var SERVICENOW_DEFAULTS = { pageId: 'my_mutual', locationVariable: 'location_on_floor_plan' };
+	function withDefaults(defaults, overrides) {
+		var out = {}, k;
+		for (k in defaults) out[k] = defaults[k];
+		for (k in overrides || {}) if (overrides[k] !== undefined) out[k] = overrides[k];
+		return out;
+	}
+	var RAW = window.MOO_TICKET_CONFIG;
+	var CFG = RAW && withDefaults(DEFAULTS, RAW);
+	if (CFG) CFG.serviceNow = withDefaults(SERVICENOW_DEFAULTS, RAW.serviceNow);
 	var TICKET = document.documentElement.getAttribute('data-ticket') || 'facilities';
 
 	var $ = function (id) { return document.getElementById(id); };
 	var els = {
 		title: $('tp-title'),
-		hint: $('tp-hint'),
 		map: $('tp-map'),
 		error: $('tp-error'),
 		form: $('tp-form'),
@@ -56,7 +82,7 @@
 		showError('map-sdk.iife.js not found — run `npm run build` in the repo root (or copy dist/map-sdk.iife.js next to this page).');
 		return;
 	}
-	var form = CFG.serviceNow && CFG.serviceNow.forms && CFG.serviceNow.forms[TICKET];
+	var form = CFG.serviceNow.forms && CFG.serviceNow.forms[TICKET];
 	if (!form || !form.sysId) {
 		showError('No ServiceNow form configured for ticket type "' + TICKET + '" (serviceNow.forms.' + TICKET + ').');
 		return;
@@ -67,9 +93,23 @@
 		showError('serviceNow.host must be an https:// URL (e.g. https://mutualofomahatest.service-now.com) — check config.local.js.');
 		return;
 	}
+	var SPACE_CODE_SOURCES = ['namePrefix', 'externalId', 'name', 'none'];
+	if (SPACE_CODE_SOURCES.indexOf(CFG.spaceCodeSource) === -1) {
+		showError('spaceCodeSource must be one of ' + SPACE_CODE_SOURCES.join(', ') + ' — check config.local.js.');
+		return;
+	}
+	// Compiled up front so a typo fails loudly here, not as a dead page.
+	var NAME_CODE = null;
+	if (CFG.spaceCodePattern) {
+		try { NAME_CODE = new RegExp(CFG.spaceCodePattern); }
+		catch (err) {
+			showError('spaceCodePattern is not a valid regular expression (' + err.message + ') — check config.local.js.');
+			return;
+		}
+	}
 	// targetOrigin for everything this page posts to an embedding parent
-	// (the SDK event mirror and the `continue` hand-off). '*' when unset.
-	var TARGET_ORIGIN = CFG.postMessageTargetOrigin || '*';
+	// (the SDK event mirror and the `continue` hand-off).
+	var TARGET_ORIGIN = CFG.postMessageTargetOrigin;
 	if (form.title) {
 		els.title.textContent = form.title;
 		document.title = form.title + ' — Select a location';
@@ -105,25 +145,26 @@
 		autoReroute: false,
 		initialFloor: CFG.initialFloor != null ? Number(CFG.initialFloor) : undefined,
 		locationSelect: {
-			selectable: CFG.selectable || ['space', 'amenity'],
+			// 'point' = the tapped spot, when no space/amenity is within
+			// maxSnapMeters → sends the floor only.
+			selectable: CFG.selectable,
 			maxSnapDistance: CFG.maxSnapDistance,
+			maxSnapMeters: CFG.maxSnapMeters, // null = no cap
 			// Optional host filter, e.g. rooms only — see config.example.js.
 			accept: typeof CFG.accept === 'function' ? CFG.accept : undefined,
 		},
 		// Mirror every mapsdk:* event to window.parent as
 		// { source: 'map-sdk', type, detail } — for a support page that iframes
 		// this picker. Harmless when the page is opened directly.
-		postMessage: { target: 'parent', targetOrigin: TARGET_ORIGIN },
+		postMessage: { targetOrigin: TARGET_ORIGIN },
 		strings: { loadingMap: 'Loading floor plan…' },
 		logger: console,
 	});
 
+	// The SDK emits floorchange for the opening floor too, so currentMapId
+	// needs no seeding here.
 	els.map.addEventListener('mapsdk:ready', function () {
 		state.ready = true;
-		if (state.currentMapId == null) {
-			var floors = map.getFloors();
-			if (floors.length) state.currentMapId = floors[0].mapId;
-		}
 		render();
 	});
 	els.map.addEventListener('mapsdk:floorchange', function (e) {
@@ -146,10 +187,17 @@
 
 	// ── Location string ────────────────────────────────────────────────────
 
+	// mapId → FloorSummary, read once (the floor list never changes after
+	// ready; floorLabels are fixed for this page).
+	var floorIndex = null;
 	function floorFor(mapId) {
-		var floors = map.getFloors();
-		for (var i = 0; i < floors.length; i++) if (floors[i].mapId === mapId) return floors[i];
-		return null;
+		if (!floorIndex) {
+			var floors = map.getFloors();
+			if (!floors.length) return null;
+			floorIndex = {};
+			for (var i = 0; i < floors.length; i++) floorIndex[floors[i].mapId] = floors[i];
+		}
+		return floorIndex[mapId] || null;
 	}
 
 	// Floor component. In order:
@@ -160,26 +208,44 @@
 	//      the Confluence example format — else the floor name with a
 	//      "Level"/"Floor"/"Lvl"/"L"/"F" prefix removed only when a number
 	//      follows ("Level 44" → "44", "Level -1" → "-1"; "Lobby" stays).
-	// A hyphen glued to a word prefix is a separator ("Lvl-5" → "5"); after a
-	// space or a one-letter prefix it is a minus sign ("L-1" → "-1").
-	var FLOOR_PREFIX = /^\s*(?:(?:level|floor|lvl)(?:-|\s*[.:]\s*|\s*)|(?:l|f)(?:\s*[.:]\s*|\s*))(?=-?\d)/i;
+	// A hyphen glued to a word prefix is a separator ("Lvl-5" → "5");
+	// otherwise it is a minus sign ("L-1" → "-1").
+	var FLOOR_PREFIX = /^\s*(?:(?:level|floor|lvl)-|(?:level|floor|lvl|l|f)\s*[.:]?\s*)(?=-?\d)/i;
 	function floorCode(mapId) {
 		if (mapId == null) return null;
 		if (CFG.floorCodes && CFG.floorCodes[mapId] != null) return String(CFG.floorCodes[mapId]);
 		var f = floorFor(mapId);
 		if (!f) return null;
 		var name = f.name ? String(f.name).trim() : '';
-		if ((CFG.floorCodeSource || 'name') === 'name') return name || null;
+		if (CFG.floorCodeSource === 'name') return name || null;
 		if (f.shortName != null && String(f.shortName).trim()) return String(f.shortName).trim();
 		if (!name) return null;
 		return name.replace(FLOOR_PREFIX, '').trim() || name;
 	}
 
-	// First word of the name when it looks like a space code (contains a
-	// digit): "17N11 Conference" → "17N11", "23S14.05" → "23S14.05",
-	// "Women's Restroom" → null. Override with config.spaceCodePattern (a regex
-	// string whose first capture group is the code).
-	var NAME_CODE = CFG.spaceCodePattern ? new RegExp(CFG.spaceCodePattern) : /^\s*(\S*\d\S*)(?:\s|$)/;
+	// The space code inside the name ('namePrefix'): the first word that
+	// contains a digit, wherever it sits — "17N11 Conference" → "17N11",
+	// "23S14.05" → "23S14.05", "IDF 19N04" → "19N04". A word that glues a
+	// label onto the code loses the label: "Dock Office1C14" → "1C14" (letters
+	// with a lowercase before the first digit are a word, not a code prefix —
+	// "B23.01" stays whole). "Women's Restroom" → null. Override with
+	// config.spaceCodePattern (a regex string whose first capture group is
+	// the code).
+	function codeInName(name) {
+		if (!name) return null;
+		if (NAME_CODE) {
+			var m = NAME_CODE.exec(String(name));
+			return m && m[1] ? m[1] : null;
+		}
+		var words = String(name).split(/\s+/);
+		for (var i = 0; i < words.length; i++) {
+			var w = words[i].replace(/^[^\w]+|[^\w]+$/g, '');
+			if (!/\d/.test(w)) continue;
+			var glued = /^[A-Za-z]*[a-z][A-Za-z]*(\d.*)$/.exec(w);
+			return glued ? glued[1] : w;
+		}
+		return null;
+	}
 
 	function propertyValue(sel, key) {
 		if (!sel || !key || !sel.properties) return null;
@@ -191,47 +257,44 @@
 	// the card): 'property' | 'externalId' | 'name' | 'namePrefix' | 'fallback'.
 	//   1. config.spaceCodeProperty — a Jibestream custom property key (Frank:
 	//      "space code would be a property … make the key configurable");
-	//   2. config.spaceCodeSource — 'externalId' | 'namePrefix' | 'name';
+	//   2. config.spaceCodeSource — 'namePrefix' | 'externalId' | 'name' | 'none';
 	//   3. nothing found → missingCodePolicy: 'floor' (send floor only — Frank)
 	//      | 'name' (use the display name) | 'deny' (block Continue).
 	function spaceCode(sel) {
 		if (!sel) return { code: null, via: null };
 		var prop = propertyValue(sel, CFG.spaceCodeProperty);
 		if (prop) return { code: prop, via: 'property' };
-		var source = CFG.spaceCodeSource || 'namePrefix';
+		var source = CFG.spaceCodeSource;
 		var code = null;
 		if (source === 'externalId') code = sel.externalId || null;
 		else if (source === 'name') code = sel.name || null;
-		else {
-			var m = sel.name ? NAME_CODE.exec(String(sel.name)) : null;
-			code = m && m[1] ? m[1] : null;
-		}
+		else if (source === 'namePrefix') code = codeInName(sel.name);
+		// 'none': only spaceCodeProperty supplies codes.
 		if (code) return { code: String(code), via: source };
 		if (policy() === 'name' && sel.name) return { code: String(sel.name), via: 'fallback' };
 		return { code: null, via: null };
 	}
-	function policy() { return CFG.missingCodePolicy || 'floor'; }
+	function policy() { return CFG.missingCodePolicy; }
 
 	// The whole location string can come from one configured property (Frank:
 	// "the configured space name should all come from a configured property,
 	// but ok to generate it … if there is no configured property").
+	// → { text, floor, codeMissing }. Format: comma AND a space between
+	// components — "HQ, Floor 44, 39E04".
 	function locationParts() {
 		var sel = state.scope === 'space' ? state.selection : null;
 		var whole = propertyValue(sel, CFG.locationProperty);
-		if (whole) return { whole: whole, parts: [whole], floor: null, code: whole, codeMissing: false };
-		var building = CFG.building || 'HQ';
-		var mapId = sel ? sel.mapId : state.currentMapId;
-		var floor = floorCode(mapId);
-		var parts = [building];
+		if (whole) return { text: whole, floor: null, codeMissing: false };
+		var floor = floorCode(sel ? sel.mapId : state.currentMapId);
+		var code = sel ? spaceCode(sel).code : null;
+		var parts = [CFG.building];
 		if (floor) parts.push(floor);
-		var sc = sel ? spaceCode(sel) : { code: null };
-		if (sc.code) parts.push(sc.code);
-		return { whole: null, parts: parts, floor: floor, code: sc.code, codeMissing: !!sel && !sc.code };
+		if (code) parts.push(code);
+		return { text: parts.join(', '), floor: floor, codeMissing: !!sel && !code };
 	}
 
 	function locationString() {
-		// Confirmed format: comma AND a space between components — "HQ, 44, 39E04".
-		return locationParts().parts.join(', ');
+		return locationParts().text;
 	}
 
 	// ── ServiceNow URL ─────────────────────────────────────────────────────
@@ -241,10 +304,10 @@
 		var vars = {};
 		if (sn.extraVariables) for (var k in sn.extraVariables) vars[k] = sn.extraVariables[k];
 		if (form.extraVariables) for (var k2 in form.extraVariables) vars[k2] = form.extraVariables[k2];
-		vars[sn.locationVariable || 'location_on_floor_plan'] = loc;
+		vars[sn.locationVariable] = loc;
 		var host = String(sn.host || '').replace(/\/+$/, '');
 		return host + '/mesp'
-			+ '?id=' + encodeURIComponent(sn.pageId || 'my_mutual')
+			+ '?id=' + encodeURIComponent(sn.pageId)
 			+ '&sys_id=' + encodeURIComponent(form.sysId)
 			+ '&view=mobile'
 			+ '&sysparm_variable_values=' + encodeURIComponent(JSON.stringify(vars))
@@ -253,7 +316,17 @@
 
 	// ── Render ─────────────────────────────────────────────────────────────
 
-	var KIND_LABEL = { space: 'Space', amenity: 'Amenity', waypoint: 'Point on the map' };
+	var KIND_LABEL = { space: 'Space', amenity: 'Amenity', waypoint: 'Point on the map', point: 'Spot on the floor' };
+
+	// "Space" when the tap was inside the room; "Nearest space · 9 m from your
+	// tap" when it snapped (the pin stays on the tap, the room is outlined).
+	function kindLine(sel) {
+		var label = KIND_LABEL[sel.kind] || sel.kind;
+		if (sel.kind === 'point') return label;
+		var m = sel.distanceMeters;
+		if (m == null || m < 1) return label;
+		return 'Nearest ' + label.toLowerCase() + ' · ' + Math.round(m) + ' m from your tap';
+	}
 
 	function setScope(scope) {
 		state.scope = scope;
@@ -268,8 +341,10 @@
 		if (sel) {
 			els.empty.hidden = true;
 			els.card.hidden = false;
-			els.kind.textContent = KIND_LABEL[sel.kind] || sel.kind;
-			els.name.textContent = sel.name || (sel.kind === 'waypoint' ? 'Unnamed point' : 'Unnamed ' + sel.kind);
+			els.kind.textContent = kindLine(sel);
+			els.name.textContent = sel.kind === 'point'
+				? (CFG.maxSnapMeters != null ? 'No space within ' + CFG.maxSnapMeters + ' m' : 'No space here') + ' — floor only'
+				: sel.name || (sel.kind === 'waypoint' ? 'Unnamed point' : 'Unnamed ' + sel.kind);
 			var fc = floorCode(sel.mapId);
 			els.floor.textContent = sel.floorName + (fc && fc !== sel.floorName ? ' (' + fc + ')' : '');
 			// Show the code that will actually be SENT, and where it came from
@@ -308,7 +383,7 @@
 		els.warning.textContent = warning;
 		els.warning.hidden = !warning;
 
-		els.location.textContent = canContinue ? locationString() : '—';
+		els.location.textContent = canContinue ? info.text : '—';
 		els.continueBtn.disabled = !canContinue;
 	}
 

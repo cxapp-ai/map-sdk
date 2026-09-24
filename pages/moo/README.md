@@ -50,17 +50,20 @@ and the SDK's `auth: { getToken }` mode, which keeps the secret server-side.
    32 floors, so the SDK shows a dropdown floor picker with ‹ › buttons
    (`floorSelectorStyle: 'auto'` switches from tabs above 6 floors).
 2. A tap resolves to the innermost named space whose unit polygon contains
-   the tap, else the nearest space/amenity waypoint (`selectable` order
-   breaks ties; an optional `accept` filter narrows candidates, e.g. skip
-   corridors). The SDK drops a dark pin and fires `mapsdk:locationselect`
-   with a `MapSelection` (`name`, `externalId`, floor, waypoint,
-   `properties` = every Jibestream custom property, `raw` Jibestream data as
-   plain JSON…).
+   the tap, else the nearest space/amenity within `maxSnapMeters` (15 m),
+   else the tapped **spot** itself (floor only). The pin stays where the
+   user tapped; the chosen room is outlined in blue when Jibestream has a
+   polygon for it (Mutual Floor 1: 21 of 52 rooms do — the rest are drawn as
+   artwork), and the card says "Nearest space · 9 m from your tap" when the
+   tap snapped. The SDK fires `mapsdk:locationselect` with a `MapSelection`
+   (`name`, `externalId`, floor, waypoint, `distanceMeters`, `properties` =
+   every Jibestream custom property, `raw` Jibestream data as plain JSON…).
 3. The sheet shows the selection. The user picks *Exactly at the selected
    space* or *Anywhere on this floor* (Confluence step 3).
 4. `location_on_floor_plan` = `"<building>, <floor>, <space code>"` or
-   `"<building>, <floor>"` — comma **and** space. Rules per Frank on MOO-598
-   (2026-09-24); at Mutual HQ this gives `HQ, Floor 43, 43C08C`:
+   `"<building>, <floor>"` — comma **and** space. Floor format and the
+   no-code rule follow Frank on MOO-598 (2026-09-24); the space-code source is
+   our choice pending his OK. At Mutual HQ this gives `HQ, Floor 43, 43C08C`:
    - whole string: `config.locationProperty` when that Jibestream property is
      set on the item (none at Mutual today); otherwise generated:
    - building: `config.building` (HQ)
@@ -69,8 +72,8 @@ and the SDK's `auth: { getToken }` mode, which keeps the secret server-side.
      (`44`, the Confluence example format)
    - space code: `config.spaceCodeProperty` (a custom property key), else
      `spaceCodeSource` — `'namePrefix'` (default: the first word of the name
-     when it contains a digit; 3545 of 3826 Mutual names), `'externalId'`
-     or `'name'`
+     when it contains a digit; 3824 of 3826 Mutual names), `'externalId'`,
+     `'name'`, or `'none'` (codes only from the property)
    - no code (e.g. "Women's Restroom"): `missingCodePolicy` — `'floor'`
      (default, Frank: send `HQ, Floor 43`), `'name'`, or `'deny'`. The card's
      "Space code" row shows exactly what will be sent.
@@ -97,11 +100,17 @@ Console helpers: `MOO_TICKET_PAGE.getSelection()`, `.getLocation()`, `.getUrl()`
 
 ## Deploying
 
-Copy `facilities.html`, `it.html`, `ticket-page.js`, `ticket-page.css`, a
-filled-in `config.local.js` and `dist/map-sdk.iife.js` to the same folder,
-and change the two `<script src="../../dist/map-sdk.iife.js">` tags to
-`./map-sdk.iife.js`. Serve over HTTPS (the Jibestream API is HTTPS-only from
-a browser origin).
+1. `npm run build`, then copy `facilities.html`, `it.html`, `ticket-page.js`,
+   `ticket-page.css`, `config.local.js` and `dist/map-sdk.iife.js` to one
+   folder.
+2. In both HTML files change `<script src="../../dist/map-sdk.iife.js">` to
+   `./map-sdk.iife.js`.
+3. In `config.local.js` set **`dryRun: false`** (the local dev copy has it
+   `true`, which makes Continue only show an alert), and set
+   `postMessageTargetOrigin` to the support page's origin if the picker is
+   ever iframed.
+4. Serve over HTTPS and point the support page's Facilities / IT buttons at
+   the two pages.
 
 ## Mutual HQ data (Jibestream customer 485, venue 2754 — checked 2026-09-24)
 
@@ -114,10 +123,24 @@ a browser origin).
 
 ## Open items (tracked on MOO-598)
 
-- Confirm with Frank/Daniel: space code = first word of the name (no
-  property exists at Mutual today).
-- Confirm the floor format ServiceNow expects: `Floor 44` (Frank) or `44`
-  (Confluence) — `floorCodeSource` switches.
+- **Client confirmation:** Mutual of Omaha has not yet confirmed the
+  standalone-minimap approach (Daniel, 2026-09-23).
+- **Hosting:** where the two pages live and who links the support-page
+  buttons to them.
+- Confirm with Frank: space code = first word of the name. He asked for a
+  property, but none exists at Mutual today.
+- Floor format: `Floor 44` (Frank, the default) vs `44` (Confluence, which
+  Daniel calls authoritative and which hasn't been updated) —
+  `floorCodeSource` switches.
+- Deliberate choices to confirm: taps farther than 15 m from any space send
+  the floor only (Frank asked for "the nearest"); the pin sits where the
+  user tapped and the chosen room is outlined — rooms Jibestream has no
+  polygon for (31 of 52 on Floor 1) get no outline.
+- IT page: Confluence mentions an "immediate-assistance" pop-up for the IT
+  flow, but its content and target POI are undefined — not built.
+- On-screen copy is provisional; the ServiceNow deep-link target (MOO-425)
+  is still open.
 - Should corridors (`… CIRC`) / utility rooms be selectable? `accept` can
   exclude them.
-- Final production ServiceNow host (`serviceNow.host`).
+- Final production ServiceNow host (`serviceNow.host`) and PROD testing of
+  the logged-in form + the MyMutual app end to end (SSO wrapper, MOO-605).

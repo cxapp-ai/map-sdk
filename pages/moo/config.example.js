@@ -31,7 +31,8 @@ window.MOO_TICKET_CONFIG = {
 	// ── location_on_floor_plan ────────────────────────────────────────────
 	// Format: "<building>, <floor>, <space code>" (comma + space), or
 	// "<building>, <floor>" for "anywhere on this floor" / no code.
-	// Decisions from Frank on MOO-598 (2026-09-24) are the defaults below.
+	// Floor format + no-code rule follow Frank on MOO-598 (2026-09-24); the
+	// space code source is our choice pending his OK (see spaceCodeSource).
 	building: 'HQ',
 
 	// Whole location string from one Jibestream custom property, when the
@@ -48,9 +49,13 @@ window.MOO_TICKET_CONFIG = {
 	//   spaceCodeProperty — a Jibestream custom property key (Frank: "space
 	//     code would be a property"). Mutual HQ has none today: 3 of 3826
 	//     destinations carry any property ("Filter Category").
-	//   spaceCodeSource — 'namePrefix' (default: first word of the name when it
-	//     contains a digit — "17N11 Conference" → "17N11"; 3545 of 3826 Mutual
-	//     names follow this), 'externalId' (4 of 3826 at Mutual), or 'name'.
+	//   spaceCodeSource — 'namePrefix' (default: the first word of the name
+	//     that contains a digit — "17N11 Conference" → "17N11", "IDF 19N04" →
+	//     "19N04", "Dock Office1C14" → "1C14"; 3824 of 3826 Mutual names),
+	//     'externalId' (4 of 3826 at Mutual), 'name', or 'none' (codes only
+	//     from spaceCodeProperty — use once Mutual has a code property).
+	//     namePrefix is our choice, not Frank's: he asked for a property, but
+	//     Mutual has none today. Pending his confirmation on MOO-598.
 	spaceCodeProperty: undefined, // e.g. 'Space Code'
 	spaceCodeSource: 'namePrefix',
 	spaceCodePattern: undefined, // regex string, capture group 1 = code (namePrefix only)
@@ -59,9 +64,15 @@ window.MOO_TICKET_CONFIG = {
 	missingCodePolicy: 'floor',
 
 	// What a tap may select: 'space' (rooms/desks/offices — Jibestream
-	// destinations), 'amenity' (POIs), 'waypoint' (any routing point; only
-	// as a last resort). Order = tie-break preference. [] = nothing.
-	selectable: ['space', 'amenity'],
+	// destinations), 'amenity' (POIs), 'waypoint' (any routing point), 'point'
+	// (the tapped spot itself when nothing is within maxSnapMeters → floor
+	// only). Order = tie-break preference. [] = nothing.
+	selectable: ['space', 'amenity', 'point'],
+	// A tap outside any room shape picks the nearest space/amenity only
+	// within this many metres; farther → 'point' (floor only). null = no cap.
+	// 15 m ≈ a large room's span. On Mutual Floor 1 open-area taps snapped a
+	// median 9.6 m (max 42 m) without a cap.
+	maxSnapMeters: 15,
 	// Optional filter over candidates — Jibestream doesn't mark rooms vs
 	// desks, so narrow by tags / keywords / name. A rejected candidate is
 	// skipped and the next-nearest accepted one is selected. e.g. rooms only:
@@ -108,6 +119,6 @@ window.MOO_TICKET_CONFIG = {
 	postMessageTargetOrigin: undefined, // e.g. 'https://mymutual.example.com'
 
 	// true = don't navigate on Continue; log + alert the URL instead (no
-	// `continue` message is posted in dry run).
+	// `continue` message is posted in dry run). MUST be false when deployed.
 	dryRun: false,
 };

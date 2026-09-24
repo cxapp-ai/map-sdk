@@ -241,31 +241,54 @@ export interface ItineraryOptions {
  *  - 'amenity'  — an amenity POI (restrooms, printers, exits, …).
  *  - 'waypoint' — a bare routing waypoint, used only when nothing else is
  *                 selectable near the tap.
+ *  - 'point'    — the tapped spot itself, when nothing above is within reach
+ *                 (`maxSnapMeters` / `maxSnapDistance`). No name or ids; a
+ *                 picker can still send "this floor, right here".
  */
-export type SelectableKind = 'space' | 'amenity' | 'waypoint';
+export type SelectableKind = 'space' | 'amenity' | 'waypoint' | 'point';
 
 /**
  * A candidate offered to `LocationSelectOptions.accept` — the identifying
- * subset of `MapSelection`, cheap enough to build for every nearby item.
+ * subset of `MapSelection` (which extends it), cheap enough to build for
+ * every nearby item.
  */
 export interface LocationCandidate {
 	kind: SelectableKind;
+	/** Floor the item is on (Jibestream mapId). */
 	mapId: number;
+	/** Item display name (destination/amenity name). Null for bare waypoints / points. */
 	name: string | null;
+	/**
+	 * Destination externalId from Jibestream — the venue's own space code
+	 * (e.g. an FM system id). Null when Jibestream has none for this item.
+	 */
 	externalId: string | null;
 	destinationId: number | null;
 	amenityId: number | null;
+	/** Routing waypoint the item is anchored to. */
 	waypointId: number | null;
 	keywords: string[];
 	tags: string[];
-	/** Jibestream custom properties (CMS "extensors"), e.g. { "Filter Category": "Office 1" }. */
+	/**
+	 * Every Jibestream custom property of the item (the CMS "extensors" map),
+	 * e.g. { "Filter Category": "Office 1" }. Plain JSON; {} when none. Use
+	 * it to read a venue-specific code (a space-management id) by key.
+	 */
 	properties: Record<string, unknown>;
+}
+
+/** Outline style for the selected room (hex colours; opacity applies to the whole shape). */
+export interface HighlightStyle {
+	fill?: string;
+	stroke?: string;
+	strokeWidth?: number;
+	opacity?: number;
 }
 
 /**
  * Opt-in tap-to-select. Off unless configured: with no `locationSelect`
  * option the map never resolves taps, emits no `locationselect` events and
- * draws no selection pin — existing hosts see no behaviour change.
+ * draws no selection pin.
  */
 export interface LocationSelectOptions {
 	/**
@@ -285,13 +308,32 @@ export interface LocationSelectOptions {
 	accept?: (candidate: LocationCandidate) => boolean;
 	/**
 	 * Reject candidates farther than this from the tap, in map units
-	 * (Jibestream local space — roughly pixels of the floor SVG; convert with
-	 * the map's mmPerPixel if you need metres). Default: no limit.
+	 * (Jibestream local space — roughly pixels of the floor SVG). Default: no
+	 * limit. Prefer `maxSnapMeters`.
 	 */
 	maxSnapDistance?: number;
-	/** Draw a pin at the selected item. Default true. */
+	/**
+	 * Reject candidates farther than this from the tap, in metres (converted
+	 * per floor through Jibestream's mmPerPixel; ignored on a floor without
+	 * scale data). With 'point' selectable, a tap beyond it selects the spot
+	 * itself. Default: no limit. When both caps are set the tighter wins.
+	 */
+	maxSnapMeters?: number;
+	/**
+	 * Draw a pin for the selection, where the user tapped. Default true. The
+	 * chosen room itself is shown by its outline (`highlight`).
+	 */
 	showPin?: boolean;
+	/**
+	 * Outline the selected space's unit polygon(s). Default true; pass a
+	 * `HighlightStyle` to theme it. Items without a polygon (amenities,
+	 * points, rooms the venue drew as artwork only) are not highlighted.
+	 */
+	highlight?: boolean | HighlightStyle;
 }
+
+/** The subset of `LocationSelectOptions` that decides what a tap resolves to. */
+export type ResolveLocationOptions = Pick<LocationSelectOptions, 'selectable' | 'accept' | 'maxSnapDistance' | 'maxSnapMeters'>;
 
 /**
  * The result of a map tap in location-select mode. Also returned by
@@ -299,10 +341,7 @@ export interface LocationSelectOptions {
  * (JSON-exported) so hosts can read venue-specific attributes without the
  * SDK having to know about them.
  */
-export interface MapSelection {
-	kind: SelectableKind;
-	/** Floor the item is on (Jibestream mapId). */
-	mapId: number;
+export interface MapSelection extends LocationCandidate {
 	/**
 	 * Floor label as shown in the floor strip — the CURRENT `floorLabels`
 	 * override applied (including a runtime `update({ provider: { floorLabels } })`).
@@ -316,32 +355,16 @@ export interface MapSelection {
 	/** Jibestream Floor.level (building order) when present. */
 	floorLevel: number | null;
 	venueId: number;
-	/** Item display name (destination/amenity name). Null for bare waypoints. */
-	name: string | null;
-	/**
-	 * Destination externalId from Jibestream — the venue's own space code
-	 * (e.g. an FM system id). Null when Jibestream has none for this item.
-	 */
-	externalId: string | null;
-	destinationId: number | null;
-	amenityId: number | null;
-	/** Routing waypoint the selection is anchored to (also the pin position). */
-	waypointId: number | null;
+	/** The item's anchor: its routing point, else its unit centre; the tap for 'point'. */
 	worldX: number;
 	worldY: number;
-	/** Where the user actually tapped, on the same floor. */
+	/** Where the user actually tapped, on the same floor (the pin sits here). */
 	tapWorldX: number;
 	tapWorldY: number;
-	/** Euclidean distance tap → item, in map units. 0 for a tap inside a unit. */
+	/** Euclidean distance tap → item, in map units. 0 for a tap inside a unit / a 'point'. */
 	distance: number;
-	keywords: string[];
-	tags: string[];
-	/**
-	 * Every Jibestream custom property of the item (the CMS "extensors" map),
-	 * e.g. { "Filter Category": "Office 1" }. Plain JSON; {} when none. Use
-	 * it to read a venue-specific code (a space-management id) by key.
-	 */
-	properties: Record<string, unknown>;
+	/** `distance` in metres (floor's mmPerPixel); null when the floor has no scale data. */
+	distanceMeters: number | null;
 	description: string | null;
 	/**
 	 * JSON-safe copies of the matched Jibestream data: `destination` /

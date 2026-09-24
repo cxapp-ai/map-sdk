@@ -478,7 +478,14 @@
 	// provider.floorLabels here lets a late update() rename tabs without a
 	// rebuild. Falls back to the engine-provided mapName when no override.
 	function floorLabel(f: FloorInfo): string {
-		return provider.floorLabels?.[f.mapId] ?? f.mapName;
+		return labelFor(f.mapId, f.mapName);
+	}
+	// The one place the CURRENT floorLabels override is applied (floor strip,
+	// selection payloads, getFloors()).
+	// Deliberately NOT untracked: the floor strip renders through this, so a
+	// runtime update({ provider: { floorLabels } }) must re-render the tabs.
+	function labelFor(mapId: number, fallback: string): string {
+		return provider.floorLabels?.[mapId] ?? fallback;
 	}
 
 	// ── Mount / rebuild ────────────────────────────────────────────────────
@@ -540,6 +547,9 @@
 					// via untrack — a change shouldn't reactively rebuild here.
 					autoReroute: untrack(() => autoReroute),
 					allFloors: untrack(() => allFloors),
+					// Show the host's opening floor first instead of rendering +
+					// settling the dominant floor and then switching.
+					initialMapId: untrack(() => initialFloorProp),
 					// Seam S1: route async post-init engine failures (e.g.
 					// auth-refresh death) to the runtime error channel.
 					onEngineError: (e) => emit('error', { message: e.message, cause: e.cause }),
@@ -548,12 +558,13 @@
 						// reactive reads here would cause effect_update_depth_exceeded.
 						untrack(() => {
 							if (!mm) return;
-							positions = projectPins(mm, currentFloor());
+							const floor = currentFloor();
+							positions = projectPins(mm, floor);
 							startPos = projectStart(mm, syntheticStart);
 							selectionPos = projectSelection(mm);
 							refreshUserOverlay();
 							if (colleaguesEnabled && allColleagueMarkers.length > 0) {
-								colleaguePositions = projectColleagues(mm, currentFloor());
+								colleaguePositions = projectColleagues(mm, floor);
 							}
 						});
 					},
@@ -563,18 +574,13 @@
 				instanceVersion++;
 				floors = inst.state.floors;
 				unresolved = inst.state.unresolved;
-				// True when the host's `initialFloor` decided the opening floor —
-				// the mount-time auto-select below must then not move the map off
-				// it (a focused resource on another floor is selected in place).
-				let honourInitialFloor = false;
+				// The host's `initialFloor`, when it is a listed floor: it wins the
+				// opening-floor pick, and the mount-time auto-select below must not
+				// move the map off it (a focused resource elsewhere is selected in place).
+				const wanted = untrack(() => initialFloorProp);
+				const hostFloor = wanted != null && inst.state.floors.some(f => f.mapId === wanted) ? wanted : null;
 				if (selectedMapId == null) {
-					let initialFloor: number | null = null;
-					// Host-requested opening floor wins when it is a listed floor.
-					const wanted = untrack(() => initialFloorProp);
-					if (wanted != null && inst.state.floors.some(f => f.mapId === wanted)) {
-						initialFloor = wanted;
-						honourInitialFloor = true;
-					}
+					let initialFloor: number | null = hostFloor;
 					const focusId = untrack(() => activeFocusId);
 					if (initialFloor == null && focusId !== undefined) {
 						const target = String(focusId);
@@ -625,7 +631,7 @@
 					// otherwise bail because selectedPin is now set. So when already
 					// selected, just re-attempt the scroll: by the retry the refs
 					// are bound and the focused card finally centres.
-					if (!selectedPin) selectByExternalId(focusId, { scroll: true, switchFloor: !honourInitialFloor });
+					if (!selectedPin) selectByExternalId(focusId, { scroll: true, switchFloor: hostFloor == null });
 					else scrollCarouselToExternalId(focusId);
 				};
 				autoSelect();
@@ -745,6 +751,8 @@
 		});
 	}
 
+	// Viewport position of a world point, or null when it isn't on the floor
+	// being shown (route start, selection pin).
 	function projectStart(
 		inst: MinimapInstance | null,
 		start: { worldX: number; worldY: number; mapId: number } | null,
@@ -1253,17 +1261,14 @@
 		}
 		selectedPin = found.pin;
 		emit('resourceselect', found.pin.resource);
-		const needsFloorSwitch = found.mapId !== selectedMapId;
-		if (needsFloorSwitch && opts.switchFloor === false) {
-			// Stay on the current floor; nothing to recenter on here.
-		} else if (needsFloorSwitch) {
+		if (found.mapId === selectedMapId) {
+			// Same floor — re-centre immediately.
+			recenterOnSelected();
+		} else if (opts.switchFloor !== false) {
 			// Defer the recenter to the floor-switch effect's `.finally`; it
 			// awaits setFloor and reframes the floor first.
 			pendingRecenterAfterSwitch = true;
 			selectedMapId = found.mapId;
-		} else {
-			// Same floor — re-centre immediately.
-			recenterOnSelected();
 		}
 		if (opts.scroll !== false) scrollCarouselToExternalId(extId);
 	}
@@ -1911,9 +1916,7 @@
 	// true forces it even single-floor (a picker wants the floor visible);
 	// false hides it (host drives floors via setFloor).
 	const showFloorChips = $derived(
-		showFloorSelector === true ? floors.length > 0
-			: showFloorSelector === false ? false
-				: floors.length > 1,
+		showFloorSelector !== false && floors.length > (showFloorSelector === true ? 0 : 1),
 	);
 	// 'auto': tabs while they reasonably fit a phone row, a compact dropdown
 	// beyond that (a 32-floor tower as tabs is unusable even when scrollable).
@@ -1964,12 +1967,18 @@
 
 	// ── Location select (tap → space / amenity) ────────────────────────────
 
+	// The selection pin sits where the user tapped; the chosen room itself is
+	// shown by its outline highlight.
 	function projectSelection(inst: MinimapInstance | null): { x: number; y: number } | null {
 		const sel = untrack(() => selection);
-		if (!inst || !sel) return null;
-		const floor = untrack(() => currentFloor());
-		if (!floor || floor.mapId !== sel.mapId) return null;
-		return inst.projectWorldToViewport(sel.worldX, sel.worldY);
+		return projectStart(inst, sel && { mapId: sel.mapId, worldX: sel.tapWorldX, worldY: sel.tapWorldY });
+	}
+
+	// Room outline for the current selection (off with highlight: false).
+	function applyHighlight(inst: MinimapInstance | null, sel: MapSelection | null): void {
+		if (!inst) return;
+		const hl = untrack(() => locSel?.highlight);
+		inst.highlightSelection(hl === false ? null : sel, typeof hl === 'object' ? hl : undefined);
 	}
 
 	// The engine bakes floor labels at build time; a runtime
@@ -1978,16 +1987,19 @@
 	// a fresh object, so the stored snapshot is never mutated.
 	function withCurrentLabels(sel: MapSelection | null): MapSelection | null {
 		if (!sel) return null;
-		const label = untrack(() => provider.floorLabels?.[sel.mapId]);
-		return label && label !== sel.floorName ? { ...sel, floorName: label } : sel;
+		const label = labelFor(sel.mapId, sel.floorName);
+		return label !== sel.floorName ? { ...sel, floorName: label } : sel;
 	}
 
 	// Drop the selection + pin; notify the host only if there was one.
 	function dropSelection(): void {
-		const had = untrack(() => selection) != null;
+		if (untrack(() => selection) == null) return;
 		selection = null;
 		selectionPos = null;
-		if (had) untrack(() => emit('locationselect', null));
+		// After tearDown `mm` is already null (the controller took its shapes
+		// with it), so this only restores styles on a live map.
+		applyHighlight(mm, null);
+		untrack(() => emit('locationselect', null));
 	}
 
 	function handleMapTap(tap: { worldX: number; worldY: number; mapId: number }): void {
@@ -1997,13 +2009,10 @@
 		// A miss (nothing selectable within maxSnapDistance) clears the
 		// selection and still notifies the host — a picker wants to know the
 		// user tapped empty floor.
-		const next = inst.resolveLocation(tap, {
-			selectable: opts.selectable,
-			maxSnapDistance: opts.maxSnapDistance,
-			accept: opts.accept,
-		});
+		const next = inst.resolveLocation(tap, opts);
 		selection = next;
 		selectionPos = projectSelection(inst);
+		applyHighlight(inst, next);
 		emit('locationselect', withCurrentLabels(next));
 	}
 
@@ -2020,7 +2029,7 @@
 	/** Listed floors, with any runtime floorLabels override applied. */
 	export function getFloors(): FloorSummary[] {
 		const base = mm?.listFloors() ?? [];
-		return base.map(f => ({ ...f, name: provider.floorLabels?.[f.mapId] ?? f.name }));
+		return base.map(f => ({ ...f, name: labelFor(f.mapId, f.name) }));
 	}
 </script>
 
@@ -2140,33 +2149,33 @@
 				<!-- Brand-blue teardrop location pin for every tenant (directory +
 				     wayfinding share one pin shape). currentColor ← --map-primary;
 				     the route destination (rm-pin-dest) renders a touch larger. -->
-				<svg class="rm-pin-teardrop-icon" viewBox="0 0 24 30" width="22" height="28" aria-hidden="true">
-					<path d="M12 1C6 1 1.5 5.5 1.5 11.3 1.5 19 12 29 12 29s10.5-10 10.5-17.7C22.5 5.5 18 1 12 1Z"
-						fill="currentColor" stroke="#fff" stroke-width="2"/>
-					<circle cx="12" cy="11" r="3.4" fill="#fff"/>
-				</svg>
+				{@render teardrop()}
 			</button>
 		{/if}
 	{/each}
 {/snippet}
 
+{#snippet teardrop()}
+	<svg class="rm-pin-teardrop-icon" viewBox="0 0 24 30" width="22" height="28" aria-hidden="true">
+		<path d="M12 1C6 1 1.5 5.5 1.5 11.3 1.5 19 12 29 12 29s10.5-10 10.5-17.7C22.5 5.5 18 1 12 1Z"
+			fill="currentColor" stroke="#fff" stroke-width="2"/>
+		<circle cx="12" cy="11" r="3.4" fill="#fff"/>
+	</svg>
+{/snippet}
+
 {#snippet selectionMarker(pos: { x: number; y: number } | null)}
 	{#if pos && selection}
-		<!-- Location-select pin: same teardrop as resource pins so the map
-		     reads as one system, but a distinct (dark) colour + halo so it is
-		     never mistaken for a resource. pointer-events:none — a tap on the
-		     pin must fall through to the canvas so the user can re-select. -->
+		<!-- Location-select pin: the selected-pin look (size + halo) in a
+		     distinct dark colour so it is never mistaken for a resource.
+		     pointer-events:none — a tap on the pin must fall through to the
+		     canvas so the user can re-select. -->
 		<div
-			class="rm-pin rm-pin-location"
+			class="rm-pin rm-pin-selected rm-pin-location"
 			role="img"
 			aria-label={`${t.selectedLocationPrefix} ${selection.name ?? ''}`}
 			style="transform: translate3d({pos.x}px, {pos.y}px, 0) translate(-50%, -100%);"
 		>
-			<svg class="rm-pin-teardrop-icon" viewBox="0 0 24 30" width="22" height="28" aria-hidden="true">
-				<path d="M12 1C6 1 1.5 5.5 1.5 11.3 1.5 19 12 29 12 29s10.5-10 10.5-17.7C22.5 5.5 18 1 12 1Z"
-					fill="currentColor" stroke="#fff" stroke-width="2"/>
-				<circle cx="12" cy="11" r="3.4" fill="#fff"/>
-			</svg>
+			{@render teardrop()}
 		</div>
 	{/if}
 {/snippet}
@@ -2208,7 +2217,7 @@
 				class="rm-floor-step"
 				aria-label={t.previousFloor}
 				disabled={idx <= 0}
-				onclick={() => { if (idx > 0) pickFloor(floors[idx - 1].mapId); }}
+				onclick={() => pickFloor(floors[idx - 1].mapId)}
 			>
 				<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
 			</button>
@@ -2233,7 +2242,7 @@
 				class="rm-floor-step"
 				aria-label={t.nextFloor}
 				disabled={idx < 0 || idx >= floors.length - 1}
-				onclick={() => { if (idx >= 0 && idx < floors.length - 1) pickFloor(floors[idx + 1].mapId); }}
+				onclick={() => pickFloor(floors[idx + 1].mapId)}
 			>
 				<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>
 			</button>
@@ -2659,7 +2668,8 @@
 		color: #fff;
 		font-weight: 600;
 	}
-	.rm-floor-tab:focus-visible {
+	.rm-floor-tab:focus-visible,
+	.rm-floor-step:focus-visible {
 		outline: 2px solid var(--map-primary, #6366f1);
 		outline-offset: 2px;
 	}
@@ -2686,10 +2696,6 @@
 	}
 	.rm-floor-step:hover:not(:disabled) { background: var(--map-surface, rgba(0,0,0,0.04)); }
 	.rm-floor-step:disabled { opacity: 0.35; cursor: default; }
-	.rm-floor-step:focus-visible {
-		outline: 2px solid var(--map-primary, #6366f1);
-		outline-offset: 2px;
-	}
 	.rm-floor-picker {
 		position: relative;
 		flex: 1 1 auto;
@@ -3056,29 +3062,8 @@
 		100% { transform: translate(-50%, -50%) scale(1.6); opacity: 0; }
 	}
 
-	/* Location-select pin (tap → space/amenity). Dark by default so it is
-	   distinct from the brand-blue resource pins; themeable via
-	   --map-selection. Sits above resource pins, below the carousel. */
-	.rm-pin-location {
-		pointer-events: none;
-		z-index: 7;
-	}
-	.rm-pin-location .rm-pin-teardrop-icon {
-		color: var(--map-selection, #0f172a);
-		width: 38px;
-		height: 48px;
-		filter: drop-shadow(0 4px 8px rgba(15,23,42,0.5));
-	}
-	.rm-pin-location::before {
-		content: '';
-		position: absolute;
-		left: 50%;
-		top: 50%;
-		width: 56px;
-		height: 56px;
-		border-radius: 50%;
-		background: rgba(15,23,42,0.22);
-		animation: rm-pulse-selected 2s ease-out infinite;
-		pointer-events: none;
-	}
+	/* Location-select pin: reuses .rm-pin-selected (size + halo); only the
+	   colour (themeable via --map-selection) and hit-testing differ. */
+	.rm-pin-location { pointer-events: none; }
+	.rm-pin-location .rm-pin-teardrop-icon { color: var(--map-selection, #0f172a); }
 </style>

@@ -305,6 +305,12 @@ Opt-in mode for pickers — "which room/desk/amenity is this ticket about?",
 "where should the meeting be?". Off unless `locationSelect` is set: existing
 mounts see no new tap handling, events or pins.
 
+**Small changes existing hosts DO see** (no option needed, all to the floor
+strip): with more than 6 floors it becomes a dropdown with ‹ › buttons
+(`floorSelectorStyle: 'tabs'` keeps tabs); a tab row that doesn't fit now
+scrolls sideways instead of clipping; and a floor with no host label falls
+back to the Jibestream floor name instead of `Floor <mapId>`.
+
 ```ts
 const map = mountIndoorMap(el, {
   provider,
@@ -315,9 +321,10 @@ const map = mountIndoorMap(el, {
   showCards: false,         // no carousel
   initialFloor: 7659,       // optional opening floor (mapId); wins over focusResourceId
   locationSelect: {
-    selectable: ['space', 'amenity'], // what a tap may resolve to; order = tie-break; [] = nothing
+    selectable: ['space', 'amenity', 'point'], // order = tie-break; 'point' = the tapped spot when nothing is in reach; [] = nothing
     accept: (c) => c.kind !== 'space' || c.tags.includes('Meeting Room'), // optional filter (rooms only)
-    maxSnapDistance: 400,             // map units; omit for no limit
+    maxSnapMeters: 15,                // snap to the nearest item only this far (metres); omit for no limit
+    highlight: true,                  // outline the selected room's polygon (or pass { fill, stroke, strokeWidth, opacity })
     showPin: true,
   },
   postMessage: { targetOrigin: 'https://host.example.com' }, // or true ('*'); mirror to window.parent
@@ -337,8 +344,13 @@ map.getFloors();     // [{ mapId, name, shortName, level, hasPins }]
 How a tap resolves (`resolveLocation` in the engine): the innermost unit
 polygon containing the tap that resolves to a named destination wins (kind
 `'space'`, distance 0); otherwise the nearest destination/amenity waypoint
-among the `selectable` kinds; `'waypoint'`, if listed, is a last-resort bare
-routing point. `accept`, when set, is applied at every step — a rejected
+among the `selectable` kinds, within `maxSnapMeters`; `'waypoint'`, if listed,
+is a last-resort bare routing point; `'point'`, if listed, is the tapped spot
+itself when nothing is in reach. The pin stays where the user tapped and
+the chosen room's outline is highlighted — venues often
+draw rooms as artwork without a tappable polygon, so a snapped tap can pick a
+room a few metres away; `distanceMeters` says how far. `accept`, when set, is
+applied at every step — a rejected
 candidate is skipped and the next-nearest accepted one wins (Jibestream
 doesn't mark rooms vs desks; filter on `tags`/`keywords`/`name`).
 
