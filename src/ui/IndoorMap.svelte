@@ -649,6 +649,9 @@
 					if (cancelled || !mm) return;
 					positions = projectPins(mm, currentFloor());
 					startPos = projectStart(mm, syntheticStart);
+					// A tap in the first ~700 ms projected its pin against a
+					// half-initialised transform too.
+					selectionPos = projectSelection(mm);
 					refreshUserOverlay();
 					autoSelect();
 				}, 700);
@@ -693,6 +696,10 @@
 			// gpsOriginVersion, so the itinerary effect re-anchors immediately
 			// rather than waiting for the next GPS tick.
 			if (mm) reprojectUserWorld(mm);
+			// Back on the selection's floor → re-apply its room outline (JMap
+			// re-shows the floor; the outline was only applied on tap).
+			const sel = untrack(() => selection);
+			if (mm && sel && sel.mapId === targetMapId && selectedMapId === targetMapId) applyHighlight(mm, sel);
 			// Settled — honour any deferred recenter request from
 			// selectByExternalId. Only if the just-landed floor is still the
 			// selectedMapId (user may have chip-clicked away mid-switch).

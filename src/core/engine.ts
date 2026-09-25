@@ -2245,6 +2245,15 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		return inside;
 	}
 
+	// The destination a unit polygon belongs to: its destinationIds, or for a
+	// waypoint-only unit the destination the venue indexes that waypoint
+	// under. ONE rule for tap resolution and the outline highlight, so a room
+	// that can be selected can also be outlined.
+	function unitDestinationId(meta: UnitEntry['meta']): number | undefined {
+		const wpId = meta?.waypointIds?.[0];
+		return meta?.destinationIds?.[0] ?? (wpId != null ? venue.byWaypointId.get(wpId)?.id : undefined);
+	}
+
 	// Candidate index: every destination + amenity waypoint with its
 	// coordinate, bucketed by floor in ONE pass over the venue on first use.
 	// `desc` caches the host-filter view (built lazily, at most once).
@@ -2380,7 +2389,7 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 			for (const e of unitIndex(world.mapId)) {
 				if ((hit && e.area >= hit.entry.area) || !unitContains(e, tx, ty)) continue;
 				const wpId = e.meta?.waypointIds?.[0];
-				const destId = e.meta?.destinationIds?.[0] ?? (wpId != null ? venue.byWaypointId.get(wpId)?.id : undefined);
+				const destId = unitDestinationId(e.meta);
 				const model = destId != null ? ((destColl?.getById?.(destId) as JModel | undefined) ?? null) : null;
 				if (!model) continue;
 				const wp = wpId != null ? waypointOnMap(mapObj, wpId) : null;
@@ -2431,25 +2440,28 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	}
 
 	// Outline highlight for the selected space: every unit polygon on the
-	// selection's floor that maps to its destination. Restores the previous
-	// highlight's original style first. No-op for items without a polygon
-	// (amenities, points, destinations the venue drew without a unit).
+	// selection's floor that maps to its destination (unitDestinationId, or
+	// any of a multi-unit destination's destinationIds). Restores the
+	// previous highlight's original style first. No-op for items without a
+	// polygon (amenities, points, destinations the venue drew without a
+	// unit). Always re-applied — never skipped as "already highlighted" — and
+	// styled on the floor's CURRENT shape objects, so it survives JMap
+	// re-showing a floor; the view calls it again after each floor switch.
 	// Redraws with ONE frame render (currentMapView.render) — not
 	// renderCurrentMapView, which rebuilds every shape and label on the floor.
 	let highlighted: unknown[] = [];
-	let highlightedKey: string | null = null;
 	function highlightSelection(sel: MapSelection | null, style: HighlightStyle = {}): void {
-		const key = sel?.destinationId != null ? `${sel.mapId}:${sel.destinationId}` : null;
-		if (key === highlightedKey) return;
 		for (const u of highlighted) {
 			try { (u as { resetStyle?: () => void }).resetStyle?.(); }
 			catch (e) { jibLog('minimap', 'resetStyle threw', e); }
 		}
 		highlighted = [];
-		highlightedKey = null;
 		const destId = sel?.destinationId;
 		const units = sel && destId != null
-			? unitIndex(sel.mapId).filter(e => e.meta?.destinationIds?.includes(destId)).map(e => e.unit)
+			? unitsOn(sel.mapId).filter(u => {
+				const meta = (u as { meta?: UnitEntry['meta'] }).meta ?? null;
+				return meta?.destinationIds?.includes(destId) || unitDestinationId(meta) === destId;
+			})
 			: [];
 		if (units.length && typeof control.styleShapes === 'function' && typeof jmap.Style === 'function') {
 			try {
@@ -2460,7 +2472,6 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 					opacity: style.opacity ?? 0.45,
 				}));
 				highlighted = units;
-				highlightedKey = key;
 			} catch (e) {
 				jibLog('minimap', 'highlightSelection threw', e);
 			}
