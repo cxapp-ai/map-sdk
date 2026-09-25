@@ -26,7 +26,10 @@ import type {
 } from './types.js';
 
 /** Imperative methods exported by the view component. */
-type IndoorMapExports = Pick<IndoorMapHandle, 'confirmBooking' | 'focusResource' | 'setFloor'>;
+type IndoorMapExports = Pick<
+	IndoorMapHandle,
+	'confirmBooking' | 'focusResource' | 'setFloor' | 'getFloors' | 'getResourceMapId' | 'getSelection' | 'clearSelection'
+>;
 
 /**
  * Component event name → `options.on` callback key. The DOM event name is
@@ -43,6 +46,7 @@ const EVENT_CALLBACKS: { [K in keyof MapEventCallbacks as EventNameOf<K>]: K } =
 	bookingstatechange: 'onBookingStateChange',
 	navigaterequested: 'onNavigateRequested',
 	fullscreenchange: 'onFullscreenChange',
+	selectionchange: 'onSelectionChange',
 	error: 'onError',
 };
 
@@ -202,6 +206,18 @@ export function mountIndoorMap(
 		colleagues: options.colleagues,
 		images: options.images,
 		navigation: options.navigation,
+		// Opt-in surface options — each default reproduces the historical view.
+		showCards: options.showCards ?? true,
+		showFloorSelector: options.showFloorSelector,
+		floorSelectorStyle: options.floorSelectorStyle ?? 'tabs',
+		floorOrder: options.floorOrder ?? 'pins',
+		allFloors: options.allFloors ?? false,
+		initialFloor: options.initialFloor,
+		pins: options.pins ?? 'all',
+		tapSelect: options.tapSelect,
+		pinShape: options.pinShape ?? 'teardrop',
+		availabilityColors: options.availabilityColors,
+		keepViewOnResize: options.keepViewOnResize ?? false,
 		strings: options.strings,
 		theme: options.theme,
 		logger: options.logger,
@@ -239,6 +255,19 @@ export function mountIndoorMap(
 			api.confirmBooking(id);
 		},
 		setFullscreen,
+		getFloors() {
+			return destroyed ? [] : api.getFloors();
+		},
+		getResourceMapId(externalId: string | number) {
+			return destroyed ? null : api.getResourceMapId(externalId);
+		},
+		getSelection() {
+			return destroyed ? null : api.getSelection();
+		},
+		clearSelection(): void {
+			if (destroyed) return;
+			api.clearSelection();
+		},
 		update(patch: {
 			provider?: Partial<Pick<MapSdkOptions['provider'], 'floorLabels' | 'kioskCoordinate' | 'venueBounds' | 'venueCenter'>>;
 			strings?: Partial<MapStrings>;

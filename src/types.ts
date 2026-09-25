@@ -133,6 +133,21 @@ export interface MapResource {
 	mapId?: number;
 	worldX?: number;
 	worldY?: number;
+	/**
+	 * Host-side "added" state (e.g. the room is on the meeting). Draws the
+	 * added pin — the same teardrop with a white plus, colour
+	 * `--map-pin-added` — and keeps the pin visible under `pins: 'selected'`.
+	 * Read live: changing it through `setResources` does not rebuild the map.
+	 */
+	added?: boolean;
+	/**
+	 * Fills the resource's unit polygon(s) with the free/busy colour, or the
+	 * parent app's grey for 'unavailable' (`availabilityColors`). Absent =
+	 * the unit keeps its venue style. Resources drawn without a unit polygon
+	 * get no fill. Read live: changing it through `setResources` repaints
+	 * without a rebuild. Fill only — every state stays selectable.
+	 */
+	availability?: 'free' | 'busy' | 'unavailable';
 }
 
 export interface ColleagueBooking {
@@ -228,6 +243,95 @@ export interface ItineraryOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Floors
+// ---------------------------------------------------------------------------
+
+/** One floor of the venue, as listed by `handle.getFloors()`. */
+export interface FloorSummary {
+	mapId: number;
+	/** Label as shown in the floor selector (current floorLabels override applied). */
+	name: string;
+	/** Jibestream Floor.shortName — usually a string ("L3", "44"); null when unset. */
+	shortName: string | number | null;
+	/** Jibestream Floor.level (building order) when present. */
+	level: number | null;
+	/** True when at least one of the mounted resources pins on this floor. */
+	hasPins: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Selection
+// ---------------------------------------------------------------------------
+
+/** Map-tap selection (`MapSdkOptions.tapSelect`). */
+export interface TapSelectOptions {
+	/**
+	 * What a map tap (or Enter / Space on a focused pin) may select:
+	 * resource types (matched against `MapResource.type`, case-insensitive,
+	 * e.g. 'room', 'desk') plus the special value 'amenity' for Jibestream
+	 * amenities (restrooms, etc.). A pin whose type is not listed ignores
+	 * Enter / Space.
+	 * Default: every host resource regardless of type, no amenities.
+	 * [] = nothing selectable.
+	 */
+	selectable?: string[];
+	/**
+	 * Cap for "nearest thing" when the tap is not inside a selectable room
+	 * polygon. Default: no cap. Ignored on floors whose venue data carries no
+	 * scale (Jibestream `mmPerPixel`).
+	 */
+	maxSnapMeters?: number;
+}
+
+/**
+ * The one selected item on the map — a host resource (its pin is drawn
+ * selected) or, with `tapSelect`, a Jibestream amenity at one of its
+ * locations (a dark marker there; `jibestream.amenityId` + `waypointId` say
+ * which). Plain JSON-safe data: every payload is a fresh copy.
+ */
+export interface MapSelection {
+	/** 'map' = the user tapped the map, a pin or a card; 'host' = `focusResource()` / `focusResourceId`. */
+	source: 'map' | 'host';
+	kind: 'resource' | 'amenity';
+	/** The CURRENT host resource (live `resources[]` entry by externalId); null for an amenity. */
+	resource: MapResource | null;
+	/** `resource.externalId` (the Jibestream waypoint id) as a string; null for an amenity. */
+	externalId: string | null;
+	name: string;
+	mapId: number;
+	/** Current floor label (`floorLabels` win). */
+	floorName: string | null;
+	/** Where the item is drawn: the resource pin / the amenity position. */
+	worldX: number;
+	worldY: number;
+	/**
+	 * The map tap that resolved it: `inside` = the tap fell inside the
+	 * resource's unit polygon; `distanceMeters` = tap → item (0 inside, null
+	 * when the floor has no scale). Null for pin, card and host selections.
+	 */
+	tap: { worldX: number; worldY: number; distanceMeters: number | null; inside: boolean } | null;
+	/**
+	 * What Jibestream has on the item; null when nothing resolves (e.g. a
+	 * resource placed by explicit coordinates). `externalId` here is the
+	 * Jibestream CMS externalId, NOT the host id. `properties` are the CMS
+	 * extensors. `raw` holds JSON copies of the matched models (`unit` only
+	 * for a tap inside the unit polygon).
+	 */
+	jibestream: {
+		destinationId: number | null;
+		amenityId: number | null;
+		waypointId: number | null;
+		name: string | null;
+		description: string | null;
+		externalId: string | null;
+		category: string | null;
+		keywords: string[];
+		properties: Record<string, unknown>;
+		raw: { destination?: unknown; amenity?: unknown; waypoint?: unknown; unit?: unknown };
+	} | null;
+}
+
+// ---------------------------------------------------------------------------
 // Theming / strings / logging
 // ---------------------------------------------------------------------------
 
@@ -268,6 +372,17 @@ export interface MapEventCallbacks {
 	}) => void;
 	onNavigateRequested: (resource: MapResource) => void;
 	onFullscreenChange: (fullscreen: boolean) => void;
+	/**
+	 * The selected item changed (see `MapSelection`): fires when a
+	 * different resource or amenity becomes selected, and with null when the
+	 * selection is cleared (`clearSelection()`, selecting a resource that
+	 * has no pin, a rebuild). Re-selecting the same item does not fire again.
+	 * An item is a resource (by externalId) or an amenity at one location
+	 * (amenity id + waypoint): a second restroom of the same amenity is a
+	 * different item. `onResourceSelect` keeps firing on every resource
+	 * selection as before.
+	 */
+	onSelectionChange: (selection: MapSelection | null) => void;
 	/**
 	 * Error channel. Fires on: mount failure (unsized/unmounted container,
 	 * venue-load rejection), geolocation denial/failure (`cause` carries the
@@ -319,6 +434,97 @@ export interface MapSdkOptions {
 	colleagues?: ColleaguesPlugin;
 	images?: ImageLoaderPlugin;
 	navigation?: NavigationPlugin;
+	/**
+	 * Render the resource card carousel. Default true. Set false for a
+	 * map-only surface (hosts that render their own list); pins still render
+	 * and `resourceselect` still fires on pin taps.
+	 */
+	showCards?: boolean;
+	/**
+	 * Floor selector visibility. Omitted (default): shown only when more than
+	 * one floor is listed — the historical behaviour. true always shows it
+	 * (even single-floor); false never does (drive floors via `setFloor`).
+	 */
+	showFloorSelector?: boolean;
+	/**
+	 * How floors are picked. 'tabs' (default): one tab per floor, the
+	 * historical row. 'dropdown': a compact picker (native select plus
+	 * previous/next buttons). 'auto': tabs for up to 6 floors, the dropdown
+	 * beyond that.
+	 */
+	floorSelectorStyle?: 'tabs' | 'dropdown' | 'auto';
+	/**
+	 * Floor order in the selector / `getFloors()`. 'pins' (default): most
+	 * pins first, then mapId — the historical order. 'building': Jibestream
+	 * Floor level, then elevation, then a numeric shortName, then mapId.
+	 * `allFloors` implies 'building'.
+	 */
+	floorOrder?: 'pins' | 'building';
+	/**
+	 * List EVERY building floor of the venue in the floor selector /
+	 * `getFloors()`, not just floors that carry a resource pin (venue-level
+	 * maps that belong to no building floor are left out), in building order
+	 * (see `floorOrder`). Also allows mounting with no `resources` at all (a
+	 * bare venue browser); a pin-less floor is framed to its full footprint.
+	 * Default false.
+	 */
+	allFloors?: boolean;
+	/**
+	 * Floor to open on: a Jibestream mapId, when it is one of the listed
+	 * floors, or `{ resource: externalId }` = the floor that resource's pin
+	 * is on (the resource is not selected). Ignored when it matches no
+	 * listed floor / no placed resource. Read once at (re)build. Wins over
+	 * the kiosk floor pick and over `focusResourceId`: a focused resource on
+	 * another floor is still selected (card + `resourceselect`), but the map
+	 * stays on this floor until the user switches. Default: the floor with
+	 * the most pins (the first listed floor under `allFloors` with no
+	 * resources).
+	 */
+	initialFloor?: number | { resource: string | number };
+	/**
+	 * Which resource pins are drawn. 'all' (default): every pin.
+	 * 'selected': only the selected resource's pin plus resources with
+	 * `added: true`.
+	 */
+	pins?: 'all' | 'selected';
+	/**
+	 * Map-tap selection. Off by default (the map ignores canvas taps). When
+	 * on, a tap selects — without recentring or zooming — the innermost
+	 * selectable resource whose unit polygon contains it, else the nearest
+	 * selectable resource pin or amenity (within `maxSnapMeters`), else
+	 * nothing (the selection stays). A tap outside the building (the
+	 * floor's Jibestream Boundary outline) selects nothing. Taps register on
+	 * pointerup, with no double-tap wait. Pins are not hit targets in this
+	 * mode (`pointer-events: none`), so a tap on a pin resolves by what is
+	 * under it; a pin focused with the keyboard still selects on Enter /
+	 * Space. `true` = defaults (every resource, no amenities). See
+	 * `onSelectionChange` / `getSelection()`.
+	 */
+	tapSelect?: boolean | TapSelectOptions;
+	/**
+	 * Pin artwork for resource pins and the amenity marker. 'teardrop'
+	 * (default): the SDK's pin (white outline; the selected pin grows and
+	 * pulses). 'material': the parent app's Material "location_on" pin — a
+	 * 40 px box with the tip on the point, a soft shadow, no outline or halo,
+	 * and the same size when selected (the colour tokens tell the states
+	 * apart). Same colour tokens either way.
+	 */
+	pinShape?: 'teardrop' | 'material';
+	/**
+	 * Unit fill colours for `MapResource.availability`. Hex only ('#rrggbb'
+	 * or '#rgb' — JMap styles can't read CSS variables). Defaults match the
+	 * parent app: free '#00D302', busy '#DF2E07', unavailable '#c2c2c2'.
+	 */
+	availabilityColors?: { free?: string; busy?: string; unavailable?: string };
+	/**
+	 * On a container resize keep the zoom and the world point at the centre
+	 * of the view (pan only) instead of re-framing the floor's pins. A
+	 * container that collapses to zero size and opens again comes back to
+	 * the view it had; a focus while it had no size is framed once it opens.
+	 * The first layout still frames the floor. Default false (every resize
+	 * re-frames the floor).
+	 */
+	keepViewOnResize?: boolean;
 	strings?: Partial<MapStrings>;
 	theme?: Partial<MapTheme>;
 	logger?: MapLogger;
@@ -329,12 +535,19 @@ export interface IndoorMapHandle {
 	/**
 	 * Replace the pinned resource set.
 	 *
-	 * REBUILD: this performs a FULL engine reload — the JMap controller is
-	 * destroyed and recreated, floor/pin/pan/booking/selection state resets,
-	 * `onReady` (and `mapsdk:ready`) re-fires, the venue/building data is
-	 * re-fetched, and there is a ~1.3s settle before the map is interactive
-	 * again. Not a cheap in-place diff. Call once with the final set rather
-	 * than repeatedly.
+	 * SIGNATURE-GATED: the engine rebuilds only when the set of
+	 * `externalId|name` pairs changes. A rebuild is a FULL engine reload —
+	 * the JMap controller is destroyed and recreated, floor/pin/pan/booking/
+	 * selection state resets, `onReady` (and `mapsdk:ready`) re-fires, the
+	 * venue/building data is re-fetched, and there is a ~1.3s settle before
+	 * the map is interactive again. Without a rebuild, the fields read live
+	 * apply in place: `added`, `availability`, `type` (tap filtering) and the
+	 * card fields (`features`, `alreadyBooked`, …) — cards, pin variants and
+	 * unit fills update without a reload. Placement (`mapId`, `worldX`/
+	 * `worldY`, `buildingExternalId`, and `floorName` as the fallback floor
+	 * label) is read only at build, so changing only those moves nothing
+	 * until the next rebuild. Call once with the final set rather than
+	 * repeatedly.
 	 */
 	setResources(resources: MapResource[]): void;
 	/** Draw (or clear, with null) a multi-stop route. */
@@ -347,13 +560,35 @@ export interface IndoorMapHandle {
 	confirmBooking(id: string | number): void;
 	setFullscreen(fullscreen: boolean): void;
 	/**
+	 * Floors currently listed in the floor selector, in display order: every
+	 * building floor under `allFloors`; otherwise the floors that carry pins
+	 * plus the `provider.kioskCoordinate` floor when one is set. Current
+	 * floorLabels applied. Empty until `ready`.
+	 */
+	getFloors(): FloorSummary[];
+	/**
+	 * Jibestream mapId of the floor this resource's pin is on in the current
+	 * build (by host externalId, as `focusResource`), or null when it has no
+	 * pin, the map is (re)building, or it was destroyed.
+	 */
+	getResourceMapId(externalId: string | number): number | null;
+	/** The current selection (a fresh plain copy, live resource fields), or null. */
+	getSelection(): MapSelection | null;
+	/**
+	 * Clear the selection (the selected pin returns to normal, the amenity
+	 * marker goes). Emits `selectionchange(null)` when something was selected.
+	 * Also drops the `focusResource()` / `focusResourceId` target, so a later
+	 * rebuild does not select it again.
+	 */
+	clearSelection(): void;
+	/**
 	 * Late-arriving config (e.g. floorLabels fetched after mount).
 	 *
 	 * REBUILD SEMANTICS — not every patch is cheap:
 	 *  - `provider.floorLabels` applies IN PLACE (renames floor labels only; no
 	 *    reload).
 	 *  - `provider.kioskCoordinate` / `provider.venueBounds` / `venueCenter`
-	 *    and any resource change trigger a FULL engine reload: controller
+	 *    and a resource-set change (see `setResources`) trigger a FULL engine reload: controller
 	 *    destroyed + recreated, state (floor/pin/pan/booking/selection) reset,
 	 *    `onReady` re-fires, venue data re-fetched, ~1.3s settle.
 	 *  - `strings` / `theme` apply in place.
