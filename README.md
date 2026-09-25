@@ -90,9 +90,10 @@ Only the *lifecycle wiring* differs per host.
 Every callback in `options.on` is ALSO a bubbling DOM CustomEvent on the
 container — `mapsdk:ready`, `mapsdk:resourceselect`, `mapsdk:floorchange`,
 `mapsdk:bookrequested`, `mapsdk:bookingstatechange` (pending/confirmed/failed),
-`mapsdk:navigaterequested`, `mapsdk:fullscreenchange`, `mapsdk:error` — payload
-in `event.detail`. Web hosts can use either channel; native WebView shells use
-the DOM-event channel (below).
+`mapsdk:navigaterequested`, `mapsdk:fullscreenchange`, `mapsdk:locationselect`
+(location-select mode only), `mapsdk:error` — payload in `event.detail`. Web
+hosts can use either channel; native WebView shells use the DOM-event channel
+(below), or the opt-in `postMessage` mirror.
 
 ### React
 
@@ -239,7 +240,8 @@ and bridge `auth.getToken` to a native token mint. The page:
     window.AndroidBridge?.onMapEvent?.(msg);                    // Android
   };
   ['mapsdk:ready','mapsdk:resourceselect','mapsdk:floorchange','mapsdk:bookrequested',
-   'mapsdk:bookingstatechange','mapsdk:navigaterequested','mapsdk:fullscreenchange','mapsdk:error']
+   'mapsdk:bookingstatechange','mapsdk:navigaterequested','mapsdk:fullscreenchange',
+   'mapsdk:locationselect','mapsdk:error']
     .forEach((t) => el.addEventListener(t, forward));
 </script>
 ```
@@ -296,6 +298,78 @@ resets, `onReady` / `mapsdk:ready` re-fires, venue data is re-fetched, and
 there is a ~1.3s settle before the map is interactive. Treat these as a
 remount, not a patch — call `setResources` once with the final set, and
 **batch** config changes into a single `update()` to avoid stacking reloads.
+
+## Location select (tap to pick a space)
+
+Opt-in mode for pickers — "which room/desk/amenity is this ticket about?",
+"where should the meeting be?". Off unless `locationSelect` is set: existing
+mounts see no new tap handling, events or pins.
+
+**Small changes existing hosts DO see** (no option needed, all to the floor
+strip): with more than 6 floors it becomes a dropdown with ‹ › buttons
+(`floorSelectorStyle: 'tabs'` keeps tabs); a tab row that doesn't fit now
+scrolls sideways instead of clipping; and a floor with no host label falls
+back to the Jibestream floor name instead of `Floor <mapId>`.
+
+```ts
+const map = mountIndoorMap(el, {
+  provider,
+  resources: [],            // a picker needs no pins…
+  allFloors: true,          // …but every venue floor in the strip
+  showFloorSelector: true,  // strip even on a single-floor venue
+  floorSelectorStyle: 'auto', // tabs ≤ 6 floors, dropdown + prev/next beyond ('tabs' | 'dropdown')
+  showCards: false,         // no carousel
+  initialFloor: 7659,       // optional opening floor (mapId); wins over focusResourceId
+  locationSelect: {
+    selectable: ['space', 'amenity', 'point'], // order = tie-break; 'point' = the tapped spot when nothing is in reach; [] = nothing
+    accept: (c) => c.kind !== 'space' || c.tags.includes('Meeting Room'), // optional filter (rooms only)
+    maxSnapMeters: 15,                // snap to the nearest item only this far (metres); omit for no limit
+    highlight: true,                  // outline the selected room's polygon (or pass { fill, stroke, strokeWidth, opacity })
+    showPin: true,
+  },
+  postMessage: { targetOrigin: 'https://host.example.com' }, // or true ('*'); mirror to window.parent
+  on: {
+    onLocationSelect: (sel) => {
+      if (!sel) return;    // tap with nothing selectable in range → cleared
+      console.log(sel.kind, sel.name, sel.externalId, sel.floorName, sel.raw);
+    },
+  },
+});
+
+map.getSelection();  // MapSelection | null — same payload as the event
+map.clearSelection();
+map.getFloors();     // [{ mapId, name, shortName, level, hasPins }]
+```
+
+How a tap resolves (`resolveLocation` in the engine): the innermost unit
+polygon containing the tap that resolves to a named destination wins (kind
+`'space'`, distance 0); otherwise the nearest destination/amenity waypoint
+among the `selectable` kinds, within `maxSnapMeters`; `'waypoint'`, if listed,
+is a last-resort bare routing point; `'point'`, if listed, is the tapped spot
+itself when nothing is in reach. The pin stays where the user tapped and
+the chosen room's outline is highlighted — venues often
+draw rooms as artwork without a tappable polygon, so a snapped tap can pick a
+room a few metres away; `distanceMeters` says how far. `accept`, when set, is
+applied at every step — a rejected
+candidate is skipped and the next-nearest accepted one wins (Jibestream
+doesn't mark rooms vs desks; filter on `tags`/`keywords`/`name`).
+
+`MapSelection` carries the item's name, Jibestream `externalId` (the venue's
+own space code), destination/amenity/waypoint ids, floor (`mapId`,
+`floorName` with the current `floorLabels` applied, `floorShortName` as
+configured in the CMS — usually a string like `"L3"`/`"44"`), tap + item
+world coords, `keywords`/`tags`/`description`, `properties` (every Jibestream
+custom property of the item — the CMS "extensors" map — so a venue-specific
+code can be read by key), and `raw` — plain-JSON copies
+of the matched Jibestream data (safe to stringify, clone or mutate).
+
+`mapsdk:locationselect` fires on every tap, and with `null` whenever the SDK
+itself drops a selection (`clearSelection()`, or a rebuild via
+`setResources` / a rebuilding `update()`). With `postMessage`, every
+`mapsdk:*` event is also posted to `window.parent` as
+`{ source: 'map-sdk', type, detail }` — details are snapshotted to plain data
+first; set `targetOrigin` for production embeds. See `pages/moo/` for a
+complete raw-HTML picker built on this.
 
 ## Engine-only (`/core`)
 

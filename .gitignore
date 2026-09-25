@@ -9,6 +9,9 @@ dist/
 .env.*
 !.env.example
 *.local
+# Raw-HTML pages read their creds from a config.local.js next to them
+# (pages/moo/config.example.js is the tracked template).
+pages/**/config.local.js
 
 # Logs & caches
 *.log

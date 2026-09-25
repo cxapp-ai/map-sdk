@@ -2,8 +2,10 @@
 
 A minimal harness that mounts the SDK from raw source (`../src`) and exercises
 the public surface: fullscreen, itinerary drawing, a mock booking plugin
-(2 s delay → confirmed), a GPS mock toggle, `focusResource`, and a log panel
-fed by the `mapsdk:*` DOM CustomEvents on the container.
+(2 s delay → confirmed), a GPS mock toggle, `focusResource`, and a
+location-select toggle (tap → nearest space/amenity). Every `mapsdk:*` DOM
+CustomEvent dispatched on the container is logged to the browser console
+(open DevTools).
 
 ## Run
 

@@ -26,7 +26,10 @@ import type {
 } from './types.js';
 
 /** Imperative methods exported by the view component. */
-type IndoorMapExports = Pick<IndoorMapHandle, 'confirmBooking' | 'focusResource' | 'setFloor'>;
+type IndoorMapExports = Pick<
+	IndoorMapHandle,
+	'confirmBooking' | 'focusResource' | 'setFloor' | 'getSelection' | 'clearSelection' | 'getFloors'
+>;
 
 /**
  * Component event name → `options.on` callback key. The DOM event name is
@@ -43,6 +46,7 @@ const EVENT_CALLBACKS: { [K in keyof MapEventCallbacks as EventNameOf<K>]: K } =
 	bookingstatechange: 'onBookingStateChange',
 	navigaterequested: 'onNavigateRequested',
 	fullscreenchange: 'onFullscreenChange',
+	locationselect: 'onLocationSelect',
 	error: 'onError',
 };
 
@@ -93,6 +97,8 @@ export function mountIndoorMap(
 	}
 	const logger = options.logger;
 	const mode = options.mode ?? 'container';
+	// postMessage mirror (iframe / WebView hosts): normalised once; null = off.
+	const pm = options.postMessage === true ? {} : (options.postMessage || null);
 
 	// The engine snapshots the container size at init — a 0×0 rect breaks the
 	// view transform, so the component will surface an error. Warn early with
@@ -143,6 +149,23 @@ export function mountIndoorMap(
 			}));
 		} catch (e) {
 			logger?.warn?.('[map-sdk] CustomEvent dispatch failed', e);
+		}
+		// Third channel, opt-in: mirror to window.postMessage so an embedding
+		// page (iframe) or a WebView shell can listen without reaching into the
+		// frame's DOM. Resources reach the view through the reactive `props`
+		// bridge, so resource-carrying details (resourceselect, bookrequested,
+		// bookingstatechange, navigaterequested) are Svelte $state PROXIES —
+		// which structured clone rejects. Snapshot to plain data first. A
+		// genuinely non-cloneable payload (a function inside bookingContext)
+		// still throws: drop that one message, never break the map.
+		if (pm && typeof window !== 'undefined') {
+			try {
+				const target = pm.target === 'self' ? window : window.parent;
+				const plain = $state.snapshot(detail);
+				target?.postMessage({ source: 'map-sdk', type: name, detail: plain }, pm.targetOrigin ?? '*');
+			} catch (e) {
+				logger?.warn?.(`[map-sdk] postMessage mirror of "${name}" failed (non-cloneable detail?)`, e);
+			}
 		}
 	}
 
@@ -202,6 +225,12 @@ export function mountIndoorMap(
 		colleagues: options.colleagues,
 		images: options.images,
 		navigation: options.navigation,
+		locationSelect: options.locationSelect ?? false,
+		showCards: options.showCards ?? true,
+		showFloorSelector: options.showFloorSelector ?? 'auto',
+		floorSelectorStyle: options.floorSelectorStyle ?? 'auto',
+		allFloors: options.allFloors ?? false,
+		initialFloor: options.initialFloor,
 		strings: options.strings,
 		theme: options.theme,
 		logger: options.logger,
@@ -239,6 +268,16 @@ export function mountIndoorMap(
 			api.confirmBooking(id);
 		},
 		setFullscreen,
+		getSelection() {
+			return destroyed ? null : api.getSelection();
+		},
+		clearSelection(): void {
+			if (destroyed) return;
+			api.clearSelection();
+		},
+		getFloors() {
+			return destroyed ? [] : api.getFloors();
+		},
 		update(patch: {
 			provider?: Partial<Pick<MapSdkOptions['provider'], 'floorLabels' | 'kioskCoordinate' | 'venueBounds' | 'venueCenter'>>;
 			strings?: Partial<MapStrings>;

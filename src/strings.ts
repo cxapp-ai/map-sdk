@@ -44,4 +44,8 @@ export const DEFAULT_STRINGS: MapStrings = {
 	distanceAwayMeters: '{d}m away', // off-venue chip; {d} = integer metres
 	distanceAwayKilometers: '{d}km away', // off-venue chip; {d} = one-decimal km
 	userFarawayLabel: 'You are {d} from the venue', // {d} = formatted distance label
+	selectedLocationPrefix: 'Selected location', // aria-label prefix for the location-select pin
+	floorSelectLabel: 'Floor', // label inside the dropdown floor picker
+	previousFloor: 'Previous floor', // aria-label, dropdown picker ‹ button
+	nextFloor: 'Next floor', // aria-label, dropdown picker › button
 };
