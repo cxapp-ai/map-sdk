@@ -44,4 +44,12 @@ export const DEFAULT_STRINGS: MapStrings = {
 	distanceAwayMeters: '{d}m away', // off-venue chip; {d} = integer metres
 	distanceAwayKilometers: '{d}km away', // off-venue chip; {d} = one-decimal km
 	userFarawayLabel: 'You are {d} from the venue', // {d} = formatted distance label
+	// appearance 'omx' — map controls + building/floor selector:
+	zoomIn: 'Zoom in',
+	zoomOut: 'Zoom out',
+	compass: 'Compass', // resets to north / toggles the building's rotation
+	buildingsAndFloors: 'Buildings and Floors', // selector title + pill fallback
+	buildings: 'Buildings', // aria-label for the building chips
+	floors: 'Floors', // aria-label for the floor list
+	close: 'Close',
 };

@@ -70,6 +70,70 @@ map.setFullscreen(true);
 map.destroy(); // mandatory teardown
 ```
 
+## The CX super app's look (`appearance: 'omx'`)
+
+`appearance: 'omx'` makes the map look and behave like the parent app's map
+(cx_map `views/dashboard/spaces/Spaces.vue` + its `WPTopBar` building/floor
+pill). Values are taken from that code, not approximated:
+
+| | What you get |
+| --- | --- |
+| Base map | CMS display-mode unit labels (`applyDisplayModeToAllUnits`; on jmap.js 4.17 the unit-label overlay, so names appear as you zoom in), `#E6EFFB` background, scale limits 0.1–20 |
+| Framing | every floor fitted to its `Boundary` layer (padding 20); a focus zooms to a square around the space (padding 80, animated) |
+| Rotation | `provider.mapRotation` (or the building's `mapRotation`), degrees; the compass toggles it with north-up |
+| Fills | `resource.availability`: `available` `#00D302`, `busy` `#DF2E07`, `disabled` `#8e8c8c`, `excluded` `#c2c2c2`, 50% opacity, `#b3b1b1` stroke |
+| Pins | none by default; the selected space gets the parent app's navy `location_on` pin; `resource.added` spaces get a brand-blue pin with a white check (navy with a check when also selected) |
+| Taps | a tap on a space selects it without moving the map; a tap on the background clears the selection |
+| Controls | zoom +/- stack and compass (bottom-right), building + floor pill (top-left) opening the "Buildings and Floors" selector |
+| No carousel | the host's list is the detail UI |
+
+```ts
+const map = mountIndoorMap(el, {
+  provider: { ...venue, mapRotation: building.mapRotation },
+  appearance: 'omx',
+  buildings: [                       // optional: the selector's building chips
+    { venueId: 2407, name: 'Building 1' },
+    { venueId: 2457, name: 'Building 2', mapRotation: 90 },
+  ],
+  resources: rooms.map(r => ({
+    externalId: r.waypointId, name: r.name, buildingExternalId: r.venueId,
+    availability: r.busy ? 'busy' : 'available',
+    added: meetingRooms.has(r.id),
+  })),
+  on: {
+    // A map tap (source 'tap') or focusResource ('focus'): highlight the row.
+    onSelectionChange: ({ resource, source }) => list.highlight(resource?.externalId ?? null),
+  },
+});
+
+row.onclick = () => map.focusResource(room.waypointId); // select + centre, no add
+map.setResources(updatedRooms); // availability / added only → repaints, no reload
+```
+
+Every piece is an option of its own, defaulting from `appearance`, so a host
+can take the look without a piece (`floorSelector: false` when it has its own
+selector, `mapControls: false`) or a piece without the look (`tapSelect: true`,
+`pins: 'selected'`, `showCards: false` on the default appearance).
+
+- **Selection API.** `selectionchange` fires once per change with
+  `{ resource, source: 'tap' | 'focus' | 'clear' }`; `clearSelection()`,
+  `getSelection()`. A rebuild reports `null` / `'clear'` and then re-selects the
+  last `focusResource`. `resourceselect` is unchanged.
+- **Floors and buildings.** Under `'omx'` the map lists every floor of the
+  building in Jibestream's order (`getFloors()`, `getCurrentFloor()`,
+  `setFloor()`, `floorchange`). With `buildings`, only resources whose
+  `buildingExternalId` is the building on screen are mapped (resources without
+  one are kept); picking a building in the selector, or `setBuilding(venueId)`,
+  rebuilds on its venue and fires `buildingchange`. A host change of
+  `provider.venueId` also switches building.
+- **Theming.** `--map-brand` (the parent app's `--main`, default `#0066DA`),
+  `--map-pin-selected` (`#1D2739`), `--map-pin-added` (`--map-brand`), and the
+  fill colours `--map-available` / `--map-busy` / `--map-disabled` /
+  `--map-excluded` — via `options.theme` or inherited from the host's CSS. Fill
+  colours must be hex (jmap parses them to integers).
+- **Try it:** `npm run dev`, then open `/omx.html` (a task-pane layout with a
+  room list; rooms come from the venue's own destinations).
+
 ## Host integration recipes
 
 The API is the same everywhere: `mountIndoorMap(container, options)` returns a
@@ -90,7 +154,8 @@ Only the *lifecycle wiring* differs per host.
 Every callback in `options.on` is ALSO a bubbling DOM CustomEvent on the
 container — `mapsdk:ready`, `mapsdk:resourceselect`, `mapsdk:floorchange`,
 `mapsdk:bookrequested`, `mapsdk:bookingstatechange` (pending/confirmed/failed),
-`mapsdk:navigaterequested`, `mapsdk:fullscreenchange`, `mapsdk:error` — payload
+`mapsdk:navigaterequested`, `mapsdk:fullscreenchange`, `mapsdk:selectionchange`,
+`mapsdk:buildingchange`, `mapsdk:error` — payload
 in `event.detail`. Web hosts can use either channel; native WebView shells use
 the DOM-event channel (below).
 
@@ -288,9 +353,11 @@ mount with `autoReroute: false`.
 
 Most handle methods are cheap in-place operations (`setItinerary`, `setFloor`,
 `focusResource`, `confirmBooking`, `setFullscreen`), and `update({ strings })`,
-`update({ theme })`, and `update({ provider: { floorLabels } })` apply in place.
+`update({ theme })`, and `update({ provider: { floorLabels | mapRotation } })`
+apply in place. `setResources` with the same set of `externalId|name` pairs —
+only `availability` / `added` (or other fields) changed — repaints in place too.
 
-**But `setResources(...)` and `update({ provider: { kioskCoordinate | venueBounds | venueCenter } })` perform a FULL engine reload**: the JMap
+**But `setResources(...)` with a changed set, `setBuilding(...)`, and `update({ provider: { kioskCoordinate | venueBounds | venueCenter } })` perform a FULL engine reload**: the JMap
 controller is destroyed and recreated, floor/pin/pan/booking/selection state
 resets, `onReady` / `mapsdk:ready` re-fires, venue data is re-fetched, and
 there is a ~1.3s settle before the map is interactive. Treat these as a
@@ -386,9 +453,10 @@ npm run check    # svelte-check
 npm run dev      # demo app (demo/, needs VITE_JIBESTREAM_* creds — never commit secrets)
 ```
 
-`jmap.js` is pinned **exactly** (4.14.1): the engine relies on undocumented
-JMap internals; treat any bump as a breaking change and re-run the demo
-smoke test against a live venue.
+`jmap.js` is pinned **exactly** (4.17.2, the version cx_map ships; the
+parent-app look needs its unit-label overlay): the engine relies on
+undocumented JMap internals; treat any bump as a breaking change and re-run the
+demo smoke test against a live venue (both `/` and `/omx.html`).
 
 **jmap.js is a runtime `dependency`, not bundled into the ESM output.** It is a
 webpack-UMD bundle of PixiJS that reassigns its own module exports at runtime;

@@ -30,6 +30,7 @@
 		type FloorInfo,
 		type PinInfo,
 		type ColleagueMarker,
+		type AvailabilityState,
 	} from '../core/engine.js';
 	import type {
 		JibestreamConfig,
@@ -44,6 +45,9 @@
 		MapStrings,
 		MapTheme,
 		MapLogger,
+		MapBuilding,
+		MapFloor,
+		MapSelectionChange,
 	} from '../types.js';
 	import { DEFAULT_STRINGS } from '../strings.js';
 	import { placeholderImageForType } from './placeholders.js';
@@ -137,6 +141,20 @@
 		 * Book button, no thumbnail, card text uses the full width.
 		 */
 		bookable?: boolean;
+		/** 'omx' = the CX super app's map look (see MapSdkOptions.appearance). */
+		appearance?: 'default' | 'omx';
+		/** Card carousel; defaults from `appearance`. */
+		showCards?: boolean;
+		/** 'all' pins or only the 'selected' + `added` ones; defaults from `appearance`. */
+		pins?: 'all' | 'selected';
+		/** Tap a space to select it; defaults from `appearance`. */
+		tapSelect?: boolean;
+		/** Floor control (tabs, or the OMX pill); default true. */
+		floorSelector?: boolean;
+		/** Buildings the OMX selector offers. */
+		buildings?: MapBuilding[];
+		/** Zoom + compass buttons; defaults from `appearance`. */
+		mapControls?: boolean;
 		/** Booking-from-card plugin. Without it, Book buttons hide. */
 		booking?: BookingPlugin;
 		/** Colleague-avatar overlay plugin. Without it, the toggle hides. */
@@ -167,6 +185,13 @@
 		autoReroute = true,
 		gps = false,
 		bookable = true,
+		appearance = 'default',
+		showCards,
+		pins,
+		tapSelect,
+		floorSelector = true,
+		buildings,
+		mapControls,
 		booking,
 		colleagues,
 		images,
@@ -179,6 +204,47 @@
 
 	// UI strings: host overrides merged over the English defaults.
 	const t = $derived({ ...DEFAULT_STRINGS, ...(strings ?? {}) } as MapStrings);
+
+	// Appearance preset → per-feature defaults (each option still overrides).
+	const isOmx = $derived(appearance === 'omx');
+	const cardsOn = $derived(showCards ?? !isOmx);
+	const pinsMode = $derived(pins ?? (isOmx ? 'selected' : 'all'));
+	const tapOn = $derived(tapSelect ?? isOmx);
+	const controlsOn = $derived(mapControls ?? isOmx);
+
+	// Buildings (OMX selector). Each is its own venue; the one on screen starts
+	// as provider.venueId and follows setBuilding / the selector. A host change
+	// of provider.venueId wins.
+	const multiBuilding = $derived((buildings?.length ?? 0) > 0);
+	let activeVenueId = $state<number | null>(untrack(() => provider.venueId ?? null));
+	let lastProviderVenueId = untrack(() => provider.venueId ?? null);
+	$effect(() => {
+		const v = provider.venueId ?? null;
+		if (v !== untrack(() => lastProviderVenueId)) {
+			lastProviderVenueId = v;
+			activeVenueId = v;
+		}
+	});
+	const activeBuilding = $derived(buildings?.find(b => Number(b.venueId) === Number(activeVenueId)) ?? null);
+	// The resources the engine maps: with buildings, those of the building on
+	// screen (by buildingExternalId; resources without one are kept).
+	const venueResources = $derived(
+		multiBuilding
+			? resources.filter(r => r.buildingExternalId == null || r.buildingExternalId === ''
+				|| Number(r.buildingExternalId) === Number(activeVenueId))
+			: resources,
+	);
+	const configuredRotation = $derived(
+		Number(activeBuilding?.mapRotation ?? provider.mapRotation ?? 0) || null,
+	);
+	// Compass: north-up until the user (or a rotation change) says otherwise.
+	let northUp = $state(false);
+	// The resource each externalId currently names — `added` / `availability`
+	// are read live from here, not from the build-time snapshot on PinInfo.
+	const liveByExt = $derived(new Map(resources.map(r => [String(r.externalId ?? ''), r])));
+	function live(pin: PinInfo): MapResource {
+		return liveByExt.get(String(pin.resource.externalId ?? '')) ?? pin.resource;
+	}
 
 	// Host theme overrides, applied as --map-* custom properties on the root.
 	// DEFAULT_THEME is deliberately NOT applied inline — every CSS usage keeps
@@ -276,6 +342,7 @@
 	// on its own.
 	let instanceVersion = $state(0);
 	let floors = $state<FloorInfo[]>([]);
+	let venueName = $state('');
 	let unresolved = $state(0);
 	let selectedMapId = $state<number | null>(null);
 	// True while a floor switch is in flight (showMap → settle → frame).
@@ -422,7 +489,7 @@
 	});
 
 	const sig = $derived(
-		resources.map(r => `${r.externalId ?? ''}|${r.name ?? ''}`).sort().join(',')
+		venueResources.map(r => `${r.externalId ?? ''}|${r.name ?? ''}`).sort().join(',')
 		// venueId is included so a live venue switch (config swapped while mounted)
 		// rebuilds the instance: teardown nulls the projected world coords, and the
 		// new venue re-projects from scratch. lastUserCoords (the user's real lat/lng)
@@ -434,7 +501,10 @@
 		// tearing down + re-initing the whole engine (a ≥1.3s rebuild for a
 		// pure rename). kioskCoordinate stays in the signature (it changes the
 		// synthetic route start / kiosk-first floor selection — a genuine rebuild).
-		+ '|cfg:' + JSON.stringify({ v: provider.venueId, k: provider.kioskCoordinate }),
+		// `availability` / `added` are deliberately NOT in it: they repaint in
+		// place. activeVenueId stands in for provider.venueId (the building on
+		// screen, which the OMX selector can change).
+		+ '|cfg:' + JSON.stringify({ v: activeVenueId, k: provider.kioskCoordinate }),
 	);
 
 	// Reactive floor-label overlay for the floor strip. The engine bakes
@@ -462,8 +532,12 @@
 		// an effect dep — the array reference changes on every parent render
 		// even when sig is stable. Same for the provider config (its
 		// render-affecting fields are already folded into sig).
-		const snapshotResources = untrack(() => resources.slice());
-		const cfg = untrack(() => provider);
+		const snapshotResources = untrack(() => venueResources.slice());
+		const cfg = untrack(() => ({ ...provider, venueId: activeVenueId ?? provider.venueId }));
+		const omxLook = untrack(() => isOmx);
+		const venuePicked = untrack(() => multiBuilding);
+		const rotationAtMount = untrack(() => (northUp ? null : configuredRotation));
+		const tapSelectOn = untrack(() => tapOn);
 		let cancelled = false;
 		// 700ms projection-settle timer (assigned in the async IIFE below). The
 		// `cancelled` guard already stops its callback from touching a torn-down
@@ -503,6 +577,14 @@
 					// Seam S2: gate + defer NavigationKit (CDN) loading. Snapshot
 					// via untrack — a change shouldn't reactively rebuild here.
 					autoReroute: untrack(() => autoReroute),
+					omx: omxLook,
+					// The OMX selector lists every floor of the building.
+					allFloors: omxLook,
+					venueFromConfig: venuePicked,
+					mapRotation: rotationAtMount,
+					onSpaceTap: tapSelectOn
+						? (ext) => untrack(() => handleSpaceTap(ext))
+						: undefined,
 					// Seam S1: route async post-init engine failures (e.g.
 					// auth-refresh death) to the runtime error channel.
 					onEngineError: (e) => emit('error', { message: e.message, cause: e.cause }),
@@ -524,6 +606,7 @@
 				mm = inst;
 				instanceVersion++;
 				floors = inst.state.floors;
+				venueName = inst.state.venueName;
 				unresolved = inst.state.unresolved;
 				if (selectedMapId == null) {
 					let initialFloor: number | null = null;
@@ -577,7 +660,7 @@
 					// otherwise bail because selectedPin is now set. So when already
 					// selected, just re-attempt the scroll: by the retry the refs
 					// are bound and the focused card finally centres.
-					if (!selectedPin) selectByExternalId(focusId, { scroll: true });
+					if (!selectedPin) selectByExternalId(focusId, { scroll: true, source: 'focus' });
 					else scrollCarouselToExternalId(focusId);
 				};
 				autoSelect();
@@ -1074,11 +1157,41 @@
 		// (the lookup is keyed on it), so fall back to a direct selection so the
 		// pin still highlights on tap.
 		if (pin.resource.externalId == null) {
-			selectedPin = pin;
-			emit('resourceselect', pin.resource);
+			setSelection(pin, 'tap');
 			return;
 		}
 		selectByExternalId(pin.resource.externalId, { scroll: true });
+	}
+
+	// The single writer of `selectedPin`. `resourceselect` keeps its original
+	// meaning (every selection of a resource, repeats included); `selectionchange`
+	// fires once per actual change, with what caused it.
+	function setSelection(
+		pin: PinInfo | null,
+		source: MapSelectionChange['source'],
+		opts: { resourceSelect?: boolean } = {},
+	): void {
+		const prev = selectedPin;
+		selectedPin = pin;
+		if (pin && opts.resourceSelect !== false) emit('resourceselect', pin.resource);
+		if (prev !== pin) {
+			const resource = pin ? ($state.snapshot(live(pin)) as MapResource) : null;
+			emit('selectionchange', { resource, source } satisfies MapSelectionChange);
+		}
+	}
+
+	// Tap-to-select (engine onSpaceTap). A tapped space is on the floor on
+	// screen, so there is no floor switch — and, like the parent app, the map
+	// never pans or zooms. A background tap (null) clears the selection.
+	function handleSpaceTap(ext: string | null): void {
+		if (ext == null) {
+			if (selectedPin) setSelection(null, 'tap');
+			return;
+		}
+		const found = pinForExternalId(ext);
+		if (!found) return;
+		setSelection(found.pin, 'tap');
+		if (cardsOn) scrollCarouselToExternalId(ext);
 	}
 
 	// ───────── Carousel state ─────────
@@ -1175,19 +1288,19 @@
 	// user is already mid-scroll on the carousel itself).
 	function selectByExternalId(
 		extId: string | number | undefined | null,
-		opts: { scroll?: boolean } = {},
+		opts: { scroll?: boolean; source?: MapSelectionChange['source'] } = {},
 	): void {
+		const source = opts.source ?? 'tap';
 		const found = pinForExternalId(extId);
 		if (!found) {
 			// Resource is in the list but unresolved on the floorplan (e.g.
 			// wrong venue). Clear the pin selection but still scroll so the
 			// card is visible.
-			selectedPin = null;
+			setSelection(null, source);
 			if (opts.scroll !== false) scrollCarouselToExternalId(extId);
 			return;
 		}
-		selectedPin = found.pin;
-		emit('resourceselect', found.pin.resource);
+		setSelection(found.pin, source);
 		const needsFloorSwitch = found.mapId !== selectedMapId;
 		if (needsFloorSwitch) {
 			// Defer the recenter to the floor-switch effect's `.finally`; it
@@ -1434,7 +1547,7 @@
 		// BOOKED card — not whatever pin happened to be selected last (which
 		// lingers when the card has no resolved pin).
 		const found = pinForExternalId(r.externalId);
-		if (found) selectedPin = found.pin;
+		if (found) setSelection(found.pin, 'tap', { resourceSelect: false });
 		pendingBookingName = r.name;
 		bookingCardName = r.name;
 		const extId = r.externalId != null ? String(r.externalId) : undefined;
@@ -1508,7 +1621,7 @@
 		// Persist the runtime focus so a later rebuild re-asserts THIS resource,
 		// not the mount-time focusResourceId prop (minor arch fix).
 		activeFocusId = id;
-		selectByExternalId(id, { scroll: true });
+		selectByExternalId(id, { scroll: true, source: 'focus' });
 	}
 
 	/** Switch floors by Jibestream mapId. */
@@ -1516,7 +1629,43 @@
 		pickFloor(mapId);
 	}
 
+	/** Drop the selection. A later rebuild does not re-select the last focus. */
+	export function clearSelection(): void {
+		activeFocusId = undefined;
+		if (selectedPin) setSelection(null, 'clear');
+	}
+
+	export function getSelection(): MapResource | null {
+		return selectedPin ? ($state.snapshot(live(selectedPin)) as MapResource) : null;
+	}
+
+	export function getFloors(): MapFloor[] {
+		return floors.map(f => ({
+			mapId: f.mapId,
+			name: floorLabel(f),
+			shortName: f.shortName,
+			pinCount: f.pins.length,
+		}));
+	}
+
+	export function getCurrentFloor(): number | null {
+		return selectedMapId;
+	}
+
+	/** Switch building (a full rebuild on its venue). */
+	export function setBuilding(venueId: number): void {
+		const b = buildings?.find(x => Number(x.venueId) === Number(venueId));
+		if (!b || Number(b.venueId) === Number(activeVenueId)) return;
+		activeVenueId = Number(b.venueId);
+		// A new building starts in its own orientation.
+		northUp = false;
+		emit('buildingchange', $state.snapshot(b));
+	}
+
 	function tearDown() {
+		// A rebuild drops the selection; tell the host (after destroy() the
+		// mount layer squelches this).
+		if (selectedPin) emit('selectionchange', { resource: null, source: 'clear' } satisfies MapSelectionChange);
 		mm?.destroy();
 		mm = null;
 		instanceVersion++;
@@ -1834,7 +1983,7 @@
 		}
 	});
 
-	const showFloorChips = $derived(floors.length > 1);
+	const showFloorChips = $derived(!isOmx && floorSelector && floors.length > 1);
 
 	// Route active → native dot drives the auto-reroute move event; suppress the
 	// HTML overlay dot so it's not doubled (useNativeUserDot's compare-double stays).
@@ -1859,9 +2008,114 @@
 	function pickFloor(mapId: number) {
 		selectedMapId = mapId;
 	}
+
+	// ── OMX: availability fills, rotation, map controls, floor picker ─────
+
+	// Fills repaint in place whenever a resource's `availability` changes (it
+	// is outside the rebuild signature) and after every (re)build.
+	const availabilitySig = $derived(
+		venueResources
+			.map(r => (r.availability && r.externalId != null ? `${r.externalId}:${r.availability}` : ''))
+			.filter(Boolean)
+			.join(','),
+	);
+	// Fill colours: --map-available / --map-busy / --map-disabled /
+	// --map-excluded, from `theme` or inherited from the host's CSS, as hex.
+	function availabilityColors(): Partial<Record<AvailabilityState, string>> {
+		const out: Partial<Record<AvailabilityState, string>> = {};
+		if (!rootEl || typeof getComputedStyle !== 'function') return out;
+		const cs = getComputedStyle(rootEl);
+		for (const k of ['available', 'busy', 'disabled', 'excluded'] as const) {
+			const v = cs.getPropertyValue(`--map-${k}`).trim();
+			if (v) out[k] = v;
+		}
+		return out;
+	}
+	$effect(() => {
+		void availabilitySig;
+		void themeTokens;
+		if (load !== 'ready') return;
+		untrack(() => {
+			if (!mm) return;
+			const byExt = new Map<string, AvailabilityState>();
+			for (const r of venueResources) {
+				if (r.externalId != null && r.availability) byExt.set(String(r.externalId), r.availability);
+			}
+			mm.setAvailability(byExt, availabilityColors());
+		});
+	});
+
+	// Rotation follows the building's CMS rotation (or north-up via the
+	// compass). The engine starts rotated; this covers later changes.
+	const effectiveRotation = $derived(northUp ? null : configuredRotation);
+	$effect(() => {
+		const rot = effectiveRotation;
+		if (load !== 'ready') return;
+		untrack(() => mm?.setRotation(rot));
+	});
+	const showNorthIcon = $derived(!configuredRotation || northUp);
+	// cx_map onMapCompass: no CMS rotation → back to north + fit; otherwise
+	// toggle north-up ⇄ the CMS rotation (the rotation change re-fits).
+	function onCompass(): void {
+		if (!configuredRotation) {
+			mm?.frameFloor();
+			return;
+		}
+		northUp = !northUp;
+	}
+
+	// Building/floor pill + selector (cx_map WPTopBar + BuildingsAndFloorsModal).
+	let floorPickerOpen = $state(false);
+	let floorPillEl: HTMLButtonElement | undefined = $state();
+	let floorPickerEl: HTMLDivElement | undefined = $state();
+	const currentFloorInfo = $derived(floors.find(f => f.mapId === selectedMapId) ?? null);
+	const floorPillLabel = $derived.by(() => {
+		const floorText = currentFloorInfo
+			? (currentFloorInfo.shortName || floorLabel(currentFloorInfo))
+			: '';
+		const buildingText = activeBuilding?.name ?? '';
+		return [buildingText, floorText].filter(Boolean).join(', ');
+	});
+	const showFloorPill = $derived(isOmx && floorSelector && (floors.length > 0 || multiBuilding));
+	function openFloorPicker(): void {
+		floorPickerOpen = true;
+		void tick().then(() => {
+			const target = floorPickerEl?.querySelector<HTMLElement>('[data-autofocus]') ?? floorPickerEl;
+			target?.focus();
+		});
+	}
+	function closeFloorPicker(): void {
+		floorPickerOpen = false;
+		void tick().then(() => floorPillEl?.focus());
+	}
+	function chooseFloor(mapId: number): void {
+		pickFloor(mapId);
+		closeFloorPicker();
+	}
+	function chooseBuilding(venueId: number): void {
+		// The modal stays open: the new building's floors list once it loads.
+		setBuilding(venueId);
+	}
+	// Esc closes; Tab stays inside the dialog.
+	function onFloorPickerKeydown(e: KeyboardEvent): void {
+		if (e.key === 'Escape') {
+			e.preventDefault();
+			e.stopPropagation();
+			closeFloorPicker();
+			return;
+		}
+		if (e.key !== 'Tab' || !floorPickerEl) return;
+		const focusable = Array.from(floorPickerEl.querySelectorAll<HTMLElement>('button:not([disabled])'));
+		if (focusable.length === 0) return;
+		const first = focusable[0];
+		const last = focusable[focusable.length - 1];
+		const active = document.activeElement;
+		if (e.shiftKey && active === first) { e.preventDefault(); last.focus(); }
+		else if (!e.shiftKey && active === last) { e.preventDefault(); first.focus(); }
+	}
 </script>
 
-<div bind:this={rootEl} class="rm-modal-card">
+<div bind:this={rootEl} class="rm-modal-card" class:rm-omx={isOmx}>
 	<div class="rm-modal-canvas-wrap">
 		<div bind:this={container} class="rm-canvas"></div>
 		{#if load === 'ready' && !switchingFloor}
@@ -1915,8 +2169,17 @@
 		<!-- Away chip rendered outside the ready-gate on purpose — REVIEWED #5.
 		     gps:false hides it entirely (no location rendered without consent). -->
 		{@render userOffMapIndicator(gpsEnabled ? userOverlay : null)}
-		{#if load === 'ready' && resources.length > 0}
+		{#if cardsOn && load === 'ready' && resources.length > 0}
 			{@render resourceCarousel()}
+		{/if}
+		{#if load === 'ready' && controlsOn}
+			{@render mapControlButtons()}
+		{/if}
+		{#if showFloorPill}
+			{@render floorPill()}
+		{/if}
+		{#if floorPickerOpen && showFloorPill}
+			{@render floorPicker()}
 		{/if}
 	</div>
 	{#if showFloorChips}
@@ -1960,7 +2223,32 @@
 
 {#snippet pinList(items: Array<{ pin: PinInfo; x: number; y: number } | null>)}
 	{#each items as item}
-		{#if item}
+		{@const selected = !!item && !!selectedPin && item.pin === selectedPin}
+		{@const added = !!item && !!live(item.pin).added}
+		{#if item && isOmx && (pinsMode === 'all' || selected || added)}
+			<!-- The parent app's pin (cx_map assets/location_on.svg, 40×40, box
+			     bottom-centre on the point, like its addComponent pins). Not
+			     interactive: a tap goes through to the space underneath, which
+			     tap-select resolves — exactly as in the parent app. Navy with a
+			     white dot = selected; brand blue with a white check = on the
+			     host's list (added); navy with a check = both. -->
+			<div
+				class="rm-omx-pin"
+				class:rm-omx-pin-selected={selected}
+				class:rm-omx-pin-added={added}
+				style="transform: translate3d({item.x}px, {item.y}px, 0) translate(-20px, -40px);"
+				aria-hidden="true"
+			>
+				<svg viewBox="0 0 40 40" width="40" height="40">
+					<path fill="currentColor" d="M19.9999 35.8492C15.8055 32.2147 12.6602 28.8324 10.5641 25.7021C8.46798 22.5715 7.41992 19.6975 7.41992 17.08C7.41992 13.2339 8.66395 10.1201 11.152 7.73875C13.6403 5.35737 16.5896 4.16667 19.9999 4.16667C23.4102 4.16667 26.3595 5.35737 28.8478 7.73875C31.3359 10.1201 32.5799 13.2339 32.5799 17.08C32.5799 19.6975 31.5319 22.5715 29.4358 25.7021C27.3396 28.8324 24.1944 32.2147 19.9999 35.8492Z"/>
+					{#if added}
+						<path d="M15.2 17.3l3.2 3.2 6.4-6.6" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+					{:else}
+						<circle cx="20" cy="17" r="5" fill="#fff"/>
+					{/if}
+				</svg>
+			</div>
+		{:else if item && !isOmx && (pinsMode === 'all' || selected || added)}
 			{@const isDest = routeActive && destIds.has(String(item.pin.resource.externalId ?? ''))}
 			<button
 				type="button"
@@ -2021,6 +2309,122 @@
 				{floorLabel(f)}
 			</button>
 		{/each}
+	</div>
+{/snippet}
+
+<!-- cx_map Spaces.vue zoom stack + compass (bottom-right). -->
+{#snippet mapControlButtons()}
+	<button type="button" class="rm-omx-compass" aria-label={t.compass} onclick={onCompass}>
+		{#if showNorthIcon}
+			<svg viewBox="0 0 27 27" width="27" height="27" fill="none" aria-hidden="true">
+				<path fill="currentColor" d="M17.5882 20.6934L17.428 10.9879L9.10292 5.99647L9.26307 15.702L17.5882 20.6934ZM15.2774 13.8626C15.1336 14.3992 14.8236 14.805 14.3473 15.08C13.871 15.355 13.3645 15.4206 12.8279 15.2768C12.2913 15.133 11.8855 14.823 11.6105 14.3467C11.3355 13.8704 11.2699 13.3639 11.4137 12.8273C11.5575 12.2907 11.8675 11.8849 12.3438 11.6099C12.8201 11.3349 13.3266 11.2693 13.8632 11.4131C14.3998 11.5569 14.8056 11.8669 15.0806 12.3432C15.3556 12.8195 15.4212 13.3259 15.2774 13.8626ZM26.2246 16.7959C25.7472 18.5775 24.9605 20.1611 23.8645 21.5469C22.7685 22.9327 21.4856 24.0498 20.0159 24.8984C18.5462 25.7469 16.9373 26.2993 15.1892 26.5556C13.4411 26.8119 11.6762 26.7013 9.89463 26.2239C8.11304 25.7466 6.52935 24.9599 5.14358 23.8639C3.75781 22.7679 2.64066 21.485 1.79213 20.0153C0.943602 18.5456 0.391195 16.9367 0.134909 15.1886C-0.121377 13.4405 -0.0108317 11.6756 0.466546 9.89402C0.943923 8.11242 1.73062 6.52873 2.82663 5.14296C3.92264 3.75719 5.20549 2.64004 6.67518 1.79151C8.14488 0.94298 9.75378 0.390576 11.5019 0.134289C13.25 -0.121996 15.0149 -0.0114504 16.7965 0.465927C18.5781 0.943305 20.1618 1.73 21.5475 2.82601C22.9333 3.92202 24.0505 5.20487 24.899 6.67456C25.7475 8.14426 26.2999 9.75316 26.5562 11.5013C26.8125 13.2494 26.7019 15.0143 26.2246 16.7959ZM23.6488 16.1057C24.4137 13.2508 24.0616 10.551 22.5924 8.00628C21.1232 5.46153 18.9611 3.80668 16.1063 3.04173C13.2514 2.27677 10.5516 2.6289 8.0069 4.09811C5.46215 5.56732 3.8073 7.72935 3.04235 10.5842C2.27739 13.439 2.62952 16.1388 4.09873 18.6836C5.56794 21.2283 7.72997 22.8832 10.5848 23.6481C13.4397 24.4131 16.1395 24.061 18.6842 22.5918C21.229 21.1225 22.8838 18.9605 23.6488 16.1057Z"/>
+			</svg>
+		{:else}
+			<svg viewBox="0 0 27 27" width="27" height="27" fill="none" aria-hidden="true">
+				<path fill="currentColor" d="M7.33333 19.3333L16.6667 16.6667L19.3333 7.33333L10 10L7.33333 19.3333ZM13.3333 15.3333C12.7778 15.3333 12.3056 15.1389 11.9167 14.75C11.5278 14.3611 11.3333 13.8889 11.3333 13.3333C11.3333 12.7778 11.5278 12.3056 11.9167 11.9167C12.3056 11.5278 12.7778 11.3333 13.3333 11.3333C13.8889 11.3333 14.3611 11.5278 14.75 11.9167C15.1389 12.3056 15.3333 12.7778 15.3333 13.3333C15.3333 13.8889 15.1389 14.3611 14.75 14.75C14.3611 15.1389 13.8889 15.3333 13.3333 15.3333ZM13.3333 26.6667C11.4889 26.6667 9.75556 26.3167 8.13333 25.6167C6.51111 24.9167 5.1 23.9667 3.9 22.7667C2.7 21.5667 1.75 20.1556 1.05 18.5333C0.35 16.9111 0 15.1778 0 13.3333C0 11.4889 0.35 9.75556 1.05 8.13333C1.75 6.51111 2.7 5.1 3.9 3.9C5.1 2.7 6.51111 1.75 8.13333 1.05C9.75556 0.35 11.4889 0 13.3333 0C15.1778 0 16.9111 0.35 18.5333 1.05C20.1556 1.75 21.5667 2.7 22.7667 3.9C23.9667 5.1 24.9167 6.51111 25.6167 8.13333C26.3167 9.75556 26.6667 11.4889 26.6667 13.3333C26.6667 15.1778 26.3167 16.9111 25.6167 18.5333C24.9167 20.1556 23.9667 21.5667 22.7667 22.7667C21.5667 23.9667 20.1556 24.9167 18.5333 25.6167C16.9111 26.3167 15.1778 26.6667 13.3333 26.6667ZM13.3333 24C16.2889 24 18.8056 22.9611 20.8833 20.8833C22.9611 18.8056 24 16.2889 24 13.3333C24 10.3778 22.9611 7.86111 20.8833 5.78333C18.8056 3.70556 16.2889 2.66667 13.3333 2.66667C10.3778 2.66667 7.86111 3.70556 5.78333 5.78333C3.70556 7.86111 2.66667 10.3778 2.66667 13.3333C2.66667 16.2889 3.70556 18.8056 5.78333 20.8833C7.86111 22.9611 10.3778 24 13.3333 24Z"/>
+			</svg>
+		{/if}
+	</button>
+	<div class="rm-omx-zoom">
+		<button type="button" aria-label={t.zoomIn} onclick={() => mm?.zoomBy(0.2)}>
+			<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M19,13H13V19H11V13H5V11H11V5H13V11H19V13Z"/></svg>
+		</button>
+		<span class="rm-omx-zoom-divider" aria-hidden="true"></span>
+		<button type="button" aria-label={t.zoomOut} onclick={() => mm?.zoomBy(-0.2)}>
+			<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M19,13H5V11H19V13Z"/></svg>
+		</button>
+	</div>
+{/snippet}
+
+<!-- cx_map WPTopBar's combined building + floor pill (mdi-domain, label,
+     chevron). Opens the selector. -->
+{#snippet floorPill()}
+	<button
+		bind:this={floorPillEl}
+		type="button"
+		class="rm-omx-floor-pill"
+		aria-haspopup="dialog"
+		aria-expanded={floorPickerOpen}
+		aria-label={`${t.buildingsAndFloors}: ${floorPillLabel}`}
+		onclick={openFloorPicker}
+	>
+		<svg class="rm-omx-floor-pill-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+			<path fill="currentColor" d="M18,15H16V17H18M18,11H16V13H18M20,19H12V17H14V15H12V13H14V11H12V9H20M10,7H8V5H10M10,11H8V9H10M10,15H8V13H10M10,19H8V17H10M6,7H4V5H6M6,11H4V9H6M6,15H4V13H6M6,19H4V17H6M12,7V3H2V21H22V7H12Z"/>
+		</svg>
+		<span class="rm-omx-floor-pill-label">{floorPillLabel || t.buildingsAndFloors}</span>
+		<svg class="rm-omx-floor-pill-chevron" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+			<path fill="currentColor" d="M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z"/>
+		</svg>
+	</button>
+{/snippet}
+
+<!-- cx_map BuildingsAndFloorsModal (browse mode): building chips, then the
+     building's floors in Jibestream's order. Scoped to the map, not the page. -->
+{#snippet floorPicker()}
+	<div
+		class="rm-omx-picker-backdrop"
+		role="presentation"
+		onclick={(e) => { if (e.target === e.currentTarget) closeFloorPicker(); }}
+	>
+		<div
+			bind:this={floorPickerEl}
+			class="rm-omx-picker"
+			role="dialog"
+			aria-modal="true"
+			aria-labelledby="rm-omx-picker-title"
+			tabindex="-1"
+			onkeydown={onFloorPickerKeydown}
+		>
+			<div class="rm-omx-picker-head">
+				<h2 id="rm-omx-picker-title" class="rm-omx-picker-title">{t.buildingsAndFloors}</h2>
+				<button type="button" class="rm-omx-picker-close" aria-label={t.close} data-autofocus onclick={closeFloorPicker}>
+					<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+						<path fill="currentColor" d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z"/>
+					</svg>
+				</button>
+			</div>
+			<!-- Always rendered, like cx_map: one chip for a single building
+			     (its venue name when the host passes no `buildings`). -->
+			<div class="rm-omx-picker-buildings" role="group" aria-label={t.buildings}>
+				{#if multiBuilding}
+					{#each buildings ?? [] as b (b.venueId)}
+						{@const active = Number(b.venueId) === Number(activeVenueId)}
+						<button
+							type="button"
+							class="rm-omx-picker-building"
+							class:rm-omx-picker-building-active={active}
+							aria-pressed={active}
+							onclick={() => chooseBuilding(b.venueId)}
+						>{b.name}</button>
+					{/each}
+				{:else if venueName}
+					<button type="button" class="rm-omx-picker-building rm-omx-picker-building-active" aria-pressed="true">{venueName}</button>
+				{/if}
+			</div>
+			<div class="rm-omx-picker-floors" role="group" aria-label={t.floors}>
+				{#if load !== 'ready'}
+					<div class="rm-omx-picker-loading" aria-live="polite">
+						<div class="rm-spinner"></div>
+					</div>
+				{:else}
+					{#each floors as f (f.mapId)}
+						{@const active = f.mapId === selectedMapId}
+						<button
+							type="button"
+							class="rm-omx-picker-floor"
+							class:rm-omx-picker-floor-active={active}
+							aria-pressed={active}
+							onclick={() => chooseFloor(f.mapId)}
+						>
+							{#if f.shortName}
+								<span class="rm-omx-picker-floor-short">{f.shortName}</span>
+							{/if}
+							<span class="rm-omx-picker-floor-name">{floorLabel(f)}</span>
+						</button>
+					{/each}
+				{/if}
+			</div>
+		</div>
 	</div>
 {/snippet}
 
@@ -2736,5 +3140,311 @@
 		0%   { transform: translate(-50%, -50%) scale(1);   opacity: 0.7; }
 		70%  { transform: translate(-50%, -50%) scale(1.6); opacity: 0; }
 		100% { transform: translate(-50%, -50%) scale(1.6); opacity: 0; }
+	}
+	/* ─── appearance 'omx': the CX super app's map (cx_map Spaces.vue) ───
+	   Values are the parent app's. Tokens: --map-brand (its --main, #0066DA),
+	   --map-pin-selected (#1D2739), --map-pin-added (--map-brand), and the
+	   fill colours --map-available/-busy/-disabled/-excluded (read by JS). */
+	.rm-omx {
+		font-family: var(--map-font-family, 'Open Sans', 'Segoe UI', system-ui, sans-serif);
+	}
+	.rm-omx .rm-modal-canvas-wrap,
+	.rm-omx .rm-loading-overlay {
+		background: #E6EFFB;
+	}
+	.rm-omx-pin {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 40px;
+		height: 40px;
+		pointer-events: none;
+		z-index: 5;
+		color: var(--map-pin-added, var(--map-brand, #0066DA));
+		filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.2));
+	}
+	.rm-omx-pin svg { display: block; }
+	/* Declared after the added rule: selected + added keeps the navy body. */
+	.rm-omx-pin-selected {
+		color: var(--map-pin-selected, #1D2739);
+		z-index: 6;
+	}
+
+	/* Zoom stack + compass: 24px from the right, like the parent app. */
+	.rm-omx-zoom {
+		position: absolute;
+		right: 24px;
+		bottom: 28px;
+		z-index: 12;
+		width: 46px;
+		display: flex;
+		flex-direction: column;
+		background: #fff;
+		border-radius: 22px;
+		box-shadow: 0 4px 14px rgba(16, 24, 40, 0.16);
+		overflow: hidden;
+	}
+	.rm-omx-zoom button {
+		width: 46px;
+		height: 46px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border: none;
+		background: transparent;
+		color: var(--map-brand, #0066DA);
+		cursor: pointer;
+		padding: 0;
+		-webkit-tap-highlight-color: transparent;
+	}
+	.rm-omx-zoom button:hover { background: #f5f9ff; }
+	.rm-omx-zoom-divider {
+		height: 1px;
+		margin: 0 8px;
+		background: #e5ebf3;
+	}
+	.rm-omx-compass {
+		position: absolute;
+		right: 25px;
+		bottom: 130px;
+		z-index: 12;
+		width: 44px;
+		height: 44px;
+		border-radius: 50%;
+		border: none;
+		background: #fff;
+		box-shadow: 0 4px 14px rgba(16, 24, 40, 0.16);
+		color: var(--map-brand, #0066DA);
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		cursor: pointer;
+		padding: 0;
+		transition: transform 0.15s ease, background-color 0.15s ease;
+		-webkit-tap-highlight-color: transparent;
+	}
+	.rm-omx-compass:hover { background: #F4F8FD; transform: scale(1.04); }
+	.rm-omx-zoom button:focus-visible,
+	.rm-omx-compass:focus-visible,
+	.rm-omx-floor-pill:focus-visible,
+	.rm-omx-picker-close:focus-visible {
+		outline: 2px solid var(--map-brand, #0066DA);
+		outline-offset: 2px;
+	}
+	/* Rows and chips keep a border / sit in a clipping scroller: cx_map draws
+	   their ring inside, so it never reads as a double border. */
+	.rm-omx-picker-floor:focus-visible,
+	.rm-omx-picker-building:focus-visible {
+		outline: 2px solid var(--map-brand, #0066DA);
+		outline-offset: -2px;
+	}
+
+	/* Building + floor pill (cx_map WPTopBar). */
+	.rm-omx-floor-pill {
+		position: absolute;
+		top: 24px;
+		left: 24px;
+		z-index: 12;
+		max-width: calc(100% - 48px);
+		height: 44px;
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+		padding: 0 16px;
+		border-radius: 999px;
+		border: 1px solid #E5E7EB;
+		background: #fff;
+		box-shadow: 0 2px 8px rgba(16, 24, 40, 0.06);
+		font: inherit;
+		font-size: 14px;
+		font-weight: 600;
+		color: #1D2739;
+		cursor: pointer;
+		transition: background-color 0.15s ease, box-shadow 0.15s ease;
+		-webkit-tap-highlight-color: transparent;
+	}
+	.rm-omx-floor-pill:hover {
+		background: #F5F7FA;
+		box-shadow: 0 3px 12px rgba(16, 24, 40, 0.1);
+	}
+	.rm-omx-floor-pill-icon { flex: none; color: var(--map-brand, #0066DA); }
+	.rm-omx-floor-pill-chevron { flex: none; color: #98a2b3; }
+	.rm-omx-floor-pill-label {
+		min-width: 0;
+		max-width: 220px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	/* Buildings and Floors selector (cx_map BuildingsAndFloorsModal), scoped
+	   to the map area rather than the page. */
+	.rm-omx-picker-backdrop {
+		position: absolute;
+		inset: 0;
+		z-index: 30;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 24px;
+		background: rgba(17, 24, 39, 0.52);
+	}
+	.rm-omx-picker {
+		width: min(477px, 100%);
+		max-height: 100%;
+		display: flex;
+		flex-direction: column;
+		gap: 24px;
+		padding: 24px;
+		border-radius: 10px;
+		background: #fff;
+		box-shadow: 0 24px 54px rgba(0, 0, 0, 0.22);
+		overflow: hidden;
+		outline: none;
+	}
+	.rm-omx-picker-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		min-height: 34px;
+		padding: 0 2px;
+	}
+	/* Balances the close button so the title centres on the card. */
+	.rm-omx-picker-head::before {
+		content: '';
+		width: 24px;
+		flex-shrink: 0;
+	}
+	.rm-omx-picker-title {
+		flex: 1;
+		margin: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 20px;
+		font-weight: 400;
+		line-height: 30px;
+		color: #1D2739;
+		text-align: center;
+	}
+	.rm-omx-picker-close {
+		flex-shrink: 0;
+		width: 24px;
+		height: 24px;
+		border-radius: 50%;
+		border: none;
+		background: transparent;
+		color: #6B7178;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		cursor: pointer;
+		padding: 0;
+	}
+	.rm-omx-picker-close:hover { background: #F4F6F8; }
+	.rm-omx-picker-buildings {
+		display: flex;
+		gap: 6px;
+		overflow-x: auto;
+		scrollbar-width: none;
+		flex: none;
+	}
+	.rm-omx-picker-buildings::-webkit-scrollbar { display: none; }
+	.rm-omx-picker-building {
+		flex: none;
+		min-width: 48px;
+		min-height: 48px;
+		padding: 8px 12px;
+		border-radius: 30px;
+		border: none;
+		background: #ECF0F4;
+		font: inherit;
+		font-size: 16px;
+		font-weight: 600;
+		line-height: 137.5%;
+		color: #1D2739;
+		white-space: nowrap;
+		cursor: pointer;
+	}
+	.rm-omx-picker-building-active {
+		background: #E6F1FE;
+		color: var(--map-brand, #0066DA);
+	}
+	.rm-omx-picker-floors {
+		display: flex;
+		flex-direction: column;
+		gap: 16px;
+		min-height: 0;
+		overflow-y: auto;
+		/* Room for the rows' focus ring inside the scroller. */
+		padding: 3px;
+		margin: -3px;
+	}
+	.rm-omx-picker-floor {
+		display: flex;
+		align-items: center;
+		gap: 9px;
+		width: 100%;
+		padding: 12px;
+		border-radius: 8px;
+		border: 1px solid #B1BBC7;
+		background: #fff;
+		font: inherit;
+		font-size: 16px;
+		font-weight: 600;
+		line-height: 22px;
+		color: #1D2739;
+		text-align: left;
+		cursor: pointer;
+		transition: border-color 0.15s ease;
+	}
+	.rm-omx-picker-floor:hover,
+	.rm-omx-picker-floor-active {
+		border-color: var(--map-brand, #0066DA);
+	}
+	.rm-omx-picker-floor-short {
+		flex: none;
+		width: 40px;
+		height: 40px;
+		border-radius: 8px;
+		background: #ECF0F4;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 16px;
+		font-weight: 600;
+		line-height: 22px;
+		color: #1D2739;
+		overflow: hidden;
+	}
+	.rm-omx-picker-floor-active .rm-omx-picker-floor-short {
+		background: var(--map-brand, #0066DA);
+		color: #fff;
+	}
+	.rm-omx-picker-floor-name {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.rm-omx-picker-loading {
+		display: flex;
+		justify-content: center;
+		padding: 24px 0;
+	}
+	/* Small map areas (a task-pane minimap): the parent app's 24px insets
+	   and 24px dialog padding would crowd the floor plan. */
+	@media (max-width: 480px) {
+		.rm-omx-floor-pill { top: 12px; left: 12px; max-width: calc(100% - 24px); }
+		.rm-omx-zoom { right: 12px; bottom: 12px; }
+		.rm-omx-compass { right: 13px; bottom: 114px; }
+		.rm-omx-picker-backdrop { padding: 12px; }
+		.rm-omx-picker { padding: 16px; gap: 16px; }
+		.rm-omx-picker-floors { gap: 8px; }
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.rm-omx-compass,
+		.rm-omx-floor-pill,
+		.rm-omx-picker-floor { transition: none; }
 	}
 </style>

@@ -75,6 +75,8 @@ const EVENT_NAMES = [
 	'bookingstatechange',
 	'navigaterequested',
 	'fullscreenchange',
+	'selectionchange',
+	'buildingchange',
 	'error',
 ] as const;
 

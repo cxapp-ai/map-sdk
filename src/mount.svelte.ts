@@ -26,7 +26,11 @@ import type {
 } from './types.js';
 
 /** Imperative methods exported by the view component. */
-type IndoorMapExports = Pick<IndoorMapHandle, 'confirmBooking' | 'focusResource' | 'setFloor'>;
+type IndoorMapExports = Pick<
+	IndoorMapHandle,
+	'confirmBooking' | 'focusResource' | 'setFloor' | 'clearSelection' | 'getSelection'
+	| 'getFloors' | 'getCurrentFloor' | 'setBuilding'
+>;
 
 /**
  * Component event name → `options.on` callback key. The DOM event name is
@@ -43,6 +47,8 @@ const EVENT_CALLBACKS: { [K in keyof MapEventCallbacks as EventNameOf<K>]: K } =
 	bookingstatechange: 'onBookingStateChange',
 	navigaterequested: 'onNavigateRequested',
 	fullscreenchange: 'onFullscreenChange',
+	selectionchange: 'onSelectionChange',
+	buildingchange: 'onBuildingChange',
 	error: 'onError',
 };
 
@@ -198,6 +204,13 @@ export function mountIndoorMap(
 		autoReroute: options.autoReroute ?? true,
 		gps: options.gps ?? false,
 		bookable: options.bookable ?? true,
+		appearance: options.appearance ?? 'default',
+		showCards: options.showCards,
+		pins: options.pins,
+		tapSelect: options.tapSelect,
+		floorSelector: options.floorSelector,
+		buildings: options.buildings,
+		mapControls: options.mapControls,
 		booking: options.booking,
 		colleagues: options.colleagues,
 		images: options.images,
@@ -238,9 +251,26 @@ export function mountIndoorMap(
 			if (destroyed) return;
 			api.confirmBooking(id);
 		},
+		clearSelection(): void {
+			if (destroyed) return;
+			api.clearSelection();
+		},
+		getSelection() {
+			return destroyed ? null : api.getSelection();
+		},
+		getFloors() {
+			return destroyed ? [] : api.getFloors();
+		},
+		getCurrentFloor() {
+			return destroyed ? null : api.getCurrentFloor();
+		},
+		setBuilding(venueId: number): void {
+			if (destroyed) return;
+			api.setBuilding(venueId);
+		},
 		setFullscreen,
 		update(patch: {
-			provider?: Partial<Pick<MapSdkOptions['provider'], 'floorLabels' | 'kioskCoordinate' | 'venueBounds' | 'venueCenter'>>;
+			provider?: Partial<Pick<MapSdkOptions['provider'], 'floorLabels' | 'kioskCoordinate' | 'venueBounds' | 'venueCenter' | 'mapRotation'>>;
 			strings?: Partial<MapStrings>;
 			theme?: Partial<MapTheme>;
 		}): void {

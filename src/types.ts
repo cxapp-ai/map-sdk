@@ -84,6 +84,54 @@ export interface JibestreamConfig {
 	venueBounds?: LatLngBounds;
 	/** Anchor for the off-venue "X m away" distance chip. */
 	venueCenter?: { lat: number; lng: number };
+	/**
+	 * Map rotation in degrees (the CMS `mapRotation` of the building). Applied
+	 * with `appearance: 'omx'`; the compass toggles between it and north-up.
+	 * A building in `buildings` with its own `mapRotation` overrides this.
+	 */
+	mapRotation?: number;
+}
+
+/**
+ * A building the building/floor selector offers (`appearance: 'omx'`). Each
+ * building is its own Jibestream venue; picking one remounts the map on it.
+ */
+export interface MapBuilding {
+	/** The building's Jibestream venueId. */
+	venueId: number;
+	name: string;
+	/** CMS map rotation in degrees for this building. */
+	mapRotation?: number;
+}
+
+/**
+ * Space fill, as the parent app paints it: available green, busy red,
+ * disabled (status error / inactive) dark grey, excluded (filtered out or not
+ * checked against the calendar) light grey. Omitted = no fill.
+ */
+export type MapAvailability = 'available' | 'busy' | 'disabled' | 'excluded';
+
+/** A floor of the venue on screen, as the floor selector lists it. */
+export interface MapFloor {
+	mapId: number;
+	/** Display name (runtime `floorLabels` applied). */
+	name: string;
+	/** Jibestream short name ("L3"), when the venue has one. */
+	shortName?: string;
+	/** Number of this mount's resources placed on the floor. */
+	pinCount: number;
+}
+
+/** What `selectionchange` reports. */
+export interface MapSelectionChange {
+	/** The selected resource, or null when the selection was cleared. */
+	resource: MapResource | null;
+	/**
+	 * 'tap': the user tapped a space (or the background) on the map.
+	 * 'focus': the host called focusResource (the map was framed on it).
+	 * 'clear': the host called clearSelection, or a rebuild dropped it.
+	 */
+	source: 'tap' | 'focus' | 'clear';
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +181,16 @@ export interface MapResource {
 	mapId?: number;
 	worldX?: number;
 	worldY?: number;
+	/**
+	 * Fills the resource's space on the floor plan. Not part of the rebuild
+	 * signature: changing it (via setResources) repaints in place.
+	 */
+	availability?: MapAvailability;
+	/**
+	 * The resource is already chosen by the host (e.g. added to the meeting):
+	 * it keeps an "added" pin under `pins: 'selected'`. Repaints in place.
+	 */
+	added?: boolean;
 }
 
 export interface ColleagueBooking {
@@ -269,6 +327,13 @@ export interface MapEventCallbacks {
 	onNavigateRequested: (resource: MapResource) => void;
 	onFullscreenChange: (fullscreen: boolean) => void;
 	/**
+	 * The selection changed: a space or background tapped on the map, a host
+	 * focusResource, clearSelection, or a rebuild. Fires once per change.
+	 */
+	onSelectionChange: (change: MapSelectionChange) => void;
+	/** The building selector (or setBuilding) switched to another venue. */
+	onBuildingChange: (building: MapBuilding) => void;
+	/**
 	 * Error channel. Fires on: mount failure (unsized/unmounted container,
 	 * venue-load rejection), geolocation denial/failure (`cause` carries the
 	 * `GeolocationPositionError`; read `(cause as GeolocationPositionError).code`
@@ -315,6 +380,43 @@ export interface MapSdkOptions {
 	 * `booking` plugin — `bookable` is the per-mount switch on top of it.
 	 */
 	bookable?: boolean;
+	/**
+	 * 'default': the SDK's own look (teardrop pins on every resource, card
+	 * carousel, floor tabs).
+	 * 'omx': the CX super app's map (cx_map Spaces.vue): CMS unit labels,
+	 * #E6EFFB background, building rotation + compass, zoom buttons, floor
+	 * fitted to its boundary, availability fills, a navy pin on the selected
+	 * space only, tap-to-select without moving the map, and the parent app's
+	 * building/floor pill + selector. The options below default from it.
+	 */
+	appearance?: 'default' | 'omx';
+	/** Resource card carousel. Default: true, false under 'omx'. */
+	showCards?: boolean;
+	/**
+	 * 'all': a pin per resource. 'selected': only the selected resource's pin
+	 * and the `added` ones. Default: 'all', 'selected' under 'omx'.
+	 */
+	pins?: 'all' | 'selected';
+	/**
+	 * Tap a space on the map to select it (never pans or zooms); a tap on the
+	 * background clears the selection. Only this mount's resources are
+	 * selectable. Default: false, true under 'omx'.
+	 */
+	tapSelect?: boolean;
+	/**
+	 * The floor control. Default: true (tabs; the building/floor pill under
+	 * 'omx'). false hides it for hosts with their own selector.
+	 */
+	floorSelector?: boolean;
+	/**
+	 * Buildings the 'omx' selector offers. The one whose venueId is
+	 * `provider.venueId` is shown first; resources are filtered to the
+	 * building on screen by `buildingExternalId` (resources without one are
+	 * kept). Omit for a single-building map.
+	 */
+	buildings?: MapBuilding[];
+	/** Zoom +/- and compass buttons. Default: false, true under 'omx'. */
+	mapControls?: boolean;
 	booking?: BookingPlugin;
 	colleagues?: ColleaguesPlugin;
 	images?: ImageLoaderPlugin;
@@ -341,8 +443,24 @@ export interface IndoorMapHandle {
 	setItinerary(ids: Array<string | number> | null, opts?: ItineraryOptions): void;
 	/** Switch floors by Jibestream mapId. */
 	setFloor(mapId: number): void;
-	/** Select + frame a resource's pin. */
+	/**
+	 * Select + frame a resource's pin (switching floor when needed). Under
+	 * 'omx' this centres and zooms on the space like the parent app's list.
+	 */
 	focusResource(id: string | number): void;
+	/** Drop the selection (selectionchange fires with source 'clear'). */
+	clearSelection(): void;
+	/** The selected resource, or null. */
+	getSelection(): MapResource | null;
+	/** Floors the selector lists, in Jibestream's order. [] before ready. */
+	getFloors(): MapFloor[];
+	/** Map id of the floor on screen, or null before ready. */
+	getCurrentFloor(): number | null;
+	/**
+	 * Switch to another building of `buildings` (a full engine rebuild on its
+	 * venue). No-op for an unknown venueId or the one on screen.
+	 */
+	setBuilding(venueId: number): void;
 	/** Flip a pending/booked state from an async host confirmation. */
 	confirmBooking(id: string | number): void;
 	setFullscreen(fullscreen: boolean): void;
@@ -351,7 +469,7 @@ export interface IndoorMapHandle {
 	 *
 	 * REBUILD SEMANTICS — not every patch is cheap:
 	 *  - `provider.floorLabels` applies IN PLACE (renames floor labels only; no
-	 *    reload).
+	 *    reload). So does `provider.mapRotation` (re-rotates the view).
 	 *  - `provider.kioskCoordinate` / `provider.venueBounds` / `venueCenter`
 	 *    and any resource change trigger a FULL engine reload: controller
 	 *    destroyed + recreated, state (floor/pin/pan/booking/selection) reset,
@@ -361,7 +479,7 @@ export interface IndoorMapHandle {
 	 * reloads.
 	 */
 	update(patch: {
-		provider?: Partial<Pick<JibestreamConfig, 'floorLabels' | 'kioskCoordinate' | 'venueBounds' | 'venueCenter'>>;
+		provider?: Partial<Pick<JibestreamConfig, 'floorLabels' | 'kioskCoordinate' | 'venueBounds' | 'venueCenter' | 'mapRotation'>>;
 		strings?: Partial<MapStrings>;
 		theme?: Partial<MapTheme>;
 	}): void;
