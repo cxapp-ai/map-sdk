@@ -267,6 +267,13 @@ export interface LocationCandidate {
 	amenityId: number | null;
 	/** Routing waypoint the item is anchored to. */
 	waypointId: number | null;
+	/**
+	 * That waypoint's own externalId from Jibestream. For an amenity with
+	 * several instances (e.g. each restroom) this is the per-instance code —
+	 * the amenity's name and properties are shared by all of them. Null when
+	 * unset.
+	 */
+	waypointExternalId: string | null;
 	keywords: string[];
 	tags: string[];
 	/**
@@ -354,6 +361,8 @@ export interface MapSelection extends LocationCandidate {
 	floorShortName: string | number | null;
 	/** Jibestream Floor.level (building order) when present. */
 	floorLevel: number | null;
+	/** Jibestream Floor.externalId from the CMS; null when unset. */
+	floorExternalId: string | null;
 	venueId: number;
 	/** The item's anchor: its routing point, else its unit centre; the tap for 'point'. */
 	worldX: number;
@@ -385,6 +394,8 @@ export interface FloorSummary {
 	shortName: string | number | null;
 	/** Jibestream Floor.level (building order) when present. */
 	level: number | null;
+	/** Jibestream Floor.externalId from the CMS; null when unset. */
+	externalId: string | null;
 	/** True when at least one of the mounted resources pins on this floor. */
 	hasPins: boolean;
 }
@@ -540,6 +551,11 @@ export interface MapSdkOptions {
 	 */
 	allFloors?: boolean;
 	/**
+	 * Draw the venue's amenity icons (restrooms, printers, cafés… — the icon
+	 * art configured per amenity in Jibestream) on the map. Default false.
+	 */
+	showAmenityIcons?: boolean;
+	/**
 	 * Floor (Jibestream mapId) to open on, when it is one of the listed
 	 * floors (ignored otherwise). Wins over the kiosk floor pick and over
 	 * `focusResourceId`: a focused resource on another floor is still
@@ -589,6 +605,13 @@ export interface IndoorMapHandle {
 	getSelection(): MapSelection | null;
 	/** Location-select mode: drop the selection + pin. Emits `locationselect` with null. */
 	clearSelection(): void;
+	/**
+	 * Location-select mode: hide (false) or re-show (true) the selection pin
+	 * and room outline, keeping the selection — e.g. while a picker's
+	 * "entire floor" option is chosen. No event. The next tap shows its new
+	 * selection again.
+	 */
+	setSelectionVisible(visible: boolean): void;
 	/**
 	 * Floors currently listed in the floor strip: every building floor under
 	 * `allFloors`; otherwise the floors that carry pins plus the

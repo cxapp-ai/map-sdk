@@ -315,7 +315,8 @@ back to the Jibestream floor name instead of `Floor <mapId>`.
 const map = mountIndoorMap(el, {
   provider,
   resources: [],            // a picker needs no pins…
-  allFloors: true,          // …but every venue floor in the strip
+  allFloors: true,          // …but every venue floor in the strip (a floor without pins is framed to its building outline)
+  showAmenityIcons: true,   // draw the venue's amenity icons (restrooms, printers…); off by default
   showFloorSelector: true,  // strip even on a single-floor venue
   floorSelectorStyle: 'auto', // tabs ≤ 6 floors, dropdown + prev/next beyond ('tabs' | 'dropdown')
   showCards: false,         // no carousel
@@ -338,6 +339,7 @@ const map = mountIndoorMap(el, {
 
 map.getSelection();  // MapSelection | null — same payload as the event
 map.clearSelection();
+map.setSelectionVisible(false); // hide pin + outline, keep the selection (true re-shows; the next tap shows its pick)
 map.getFloors();     // [{ mapId, name, shortName, level, hasPins }]
 ```
 
@@ -355,7 +357,9 @@ candidate is skipped and the next-nearest accepted one wins (Jibestream
 doesn't mark rooms vs desks; filter on `tags`/`keywords`/`name`).
 
 `MapSelection` carries the item's name, Jibestream `externalId` (the venue's
-own space code), destination/amenity/waypoint ids, floor (`mapId`,
+own space code), destination/amenity/waypoint ids, `waypointExternalId` (the
+matched waypoint's own externalId — the per-instance code of an amenity with
+several instances, e.g. each restroom), floor (`mapId`,
 `floorName` with the current `floorLabels` applied, `floorShortName` as
 configured in the CMS — usually a string like `"L3"`/`"44"`), tap + item
 world coords, `keywords`/`tags`/`description`, `properties` (every Jibestream

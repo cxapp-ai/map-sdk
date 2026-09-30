@@ -11,6 +11,10 @@
 	--tp-border: rgba(15, 23, 42, 0.1);
 	--tp-primary: #0057b8;
 	--tp-primary-text: #ffffff;
+	--tp-primary-soft: rgba(0, 87, 184, 0.07);
+	--tp-line: rgba(15, 23, 42, 0.14);
+	--tp-disabled-bg: #e2e8f0;
+	--tp-note-bg: #f5f3ef;
 	--tp-warning-bg: #fff7ed;
 	--tp-warning-text: #9a3412;
 	--tp-error-bg: #fef2f2;
@@ -71,6 +75,35 @@ body {
 	position: absolute;
 	inset: 0;
 }
+/* What a tap does right now — a pill over the top of the map. Never takes
+   taps (they belong to the map). */
+.tp-banner {
+	position: absolute;
+	top: 10px;
+	left: 50%;
+	transform: translateX(-50%);
+	z-index: 20;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	width: max-content;
+	max-width: calc(100% - 24px);
+	padding: 7px 14px;
+	border-radius: 999px;
+	background: var(--tp-surface);
+	color: var(--tp-text);
+	font-size: 13px;
+	font-weight: 600;
+	line-height: 1.35;
+	box-shadow: 0 4px 12px rgba(15, 24, 108, 0.14);
+	pointer-events: none;
+	transition: background-color 0.2s ease, color 0.2s ease;
+}
+.tp-banner .tp-icon { width: 18px; height: 18px; }
+.tp-banner-floor {
+	background: var(--tp-primary);
+	color: var(--tp-primary-text);
+}
 .tp-error {
 	position: absolute;
 	left: 12px;
@@ -94,76 +127,164 @@ body {
 	gap: 12px;
 }
 
-/* Same height empty or filled: the sheet sits under the map in the grid,
-   so a sheet that grows on the first tap would shrink the map, and the SDK
-   re-frames (re-zooms) the floor on every resize. */
-.tp-selection-empty,
-.tp-selection-card {
-	min-height: 88px;
+.tp-icon {
+	flex: none;
+	width: 20px;
+	height: 20px;
+	fill: currentColor;
 }
-.tp-selection-empty {
+
+/* ── What the request covers ────────────────────────────────────────────── */
+.tp-scope {
+	margin: 0;
+	padding: 0;
+	border: none;
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 8px;
+}
+.tp-scope-legend {
+	padding: 0;
+	margin-bottom: 8px;
+	font-size: 15px;
+	font-weight: 700;
+}
+.tp-option {
 	display: flex;
 	align-items: center;
-	justify-content: center;
-	font-size: 14px;
-	color: var(--tp-muted);
+	gap: 10px;
+	min-height: 52px;
 	padding: 10px 12px;
-	border: 1px dashed var(--tp-border);
+	border: 2px solid var(--tp-line);
 	border-radius: var(--tp-radius);
-	text-align: center;
+	background: var(--tp-surface);
+	font-size: 14px;
+	font-weight: 600;
+	line-height: 1.3;
+	cursor: pointer;
+	transition: border-color 0.15s ease, background-color 0.15s ease;
 }
-.tp-selection-card {
+.tp-option:has(input:checked) {
+	border-color: var(--tp-primary);
+	background: var(--tp-primary-soft);
+}
+.tp-option input {
+	flex: none;
+	width: 18px;
+	height: 18px;
+	margin: 0;
+	accent-color: var(--tp-primary);
+}
+.tp-option:has(input:focus-visible) {
+	outline: 2px solid var(--tp-primary);
+	outline-offset: 2px;
+}
+
+/* ── Selection ──────────────────────────────────────────────────────────── */
+/* One fixed-height slot for every state (prompt, space, entire floor + pin
+   note): the sheet sits under the map in the grid, so a sheet that grows
+   would shrink the map, and the SDK re-frames (re-zooms) the floor on every
+   resize. */
+.tp-selection {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	min-height: 140px; /* the tallest state: entire floor + pin note */
+}
+/* The visible card fills the slot. */
+.tp-prompt,
+.tp-card { flex: 1 0 auto; }
+@media (max-width: 379px) {
+	.tp-selection { min-height: 158px; } /* the pin note wraps to 3 lines */
+}
+.tp-prompt {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	padding: 14px 16px;
+	border: 1px dashed var(--tp-line);
+	border-radius: var(--tp-radius);
+	color: var(--tp-muted);
+	font-size: 14px;
+	line-height: 1.4;
+}
+.tp-prompt .tp-icon { width: 24px; height: 24px; color: var(--tp-primary); }
+.tp-card {
 	display: grid;
+	align-content: start;
 	grid-template-columns: 1fr auto;
 	grid-template-areas:
 		"kind clear"
-		"name clear"
-		"meta meta";
+		"name name"
+		"meta meta"
+		"note note";
 	column-gap: 12px;
 	row-gap: 2px;
-	padding: 10px 12px;
-	border: 1px solid rgba(0, 87, 184, 0.25);
+	padding: 12px 14px;
+	border: 1px solid var(--tp-line);
 	border-radius: var(--tp-radius);
-	background: rgba(0, 87, 184, 0.04);
+	background: var(--tp-surface);
 }
-.tp-selection-kind {
+.tp-card-kind {
 	grid-area: kind;
+	align-self: center;
 	font-size: 11px;
 	font-weight: 600;
-	letter-spacing: 0.04em;
+	letter-spacing: 0.08em;
 	text-transform: uppercase;
 	color: var(--tp-muted);
 }
-.tp-selection-name {
+.tp-card-name {
 	grid-area: name;
-	font-size: 16px;
+	font-size: 18px;
 	font-weight: 700;
-	line-height: 1.3;
+	line-height: 1.35;
 	overflow-wrap: anywhere;
 }
-.tp-selection-meta {
+.tp-card-meta {
 	grid-area: meta;
 	display: flex;
 	flex-wrap: wrap;
 	gap: 4px 16px;
-	margin: 6px 0 0;
+	margin: 2px 0 0;
 	font-size: 13px;
+	color: var(--tp-muted);
 }
-.tp-selection-meta div { display: flex; gap: 6px; }
-.tp-selection-meta dt { color: var(--tp-muted); }
-.tp-selection-meta dd { margin: 0; font-weight: 600; }
+.tp-card-meta div { display: flex; gap: 6px; }
+.tp-card-meta dd { margin: 0; font-weight: 700; color: var(--tp-text); }
 .tp-link {
 	grid-area: clear;
-	align-self: start;
+	align-self: center;
 	border: none;
 	background: none;
-	padding: 4px 0;
+	padding: 2px 0;
 	color: var(--tp-primary);
 	font: inherit;
-	font-size: 13px;
+	font-size: 14px;
 	font-weight: 600;
 	cursor: pointer;
 	white-space: nowrap;
+}
+.tp-note {
+	grid-area: note;
+	display: flex;
+	gap: 8px;
+	margin: 6px 0 0;
+	padding: 6px 10px;
+	border-radius: 10px;
+	background: var(--tp-note-bg);
+	font-size: 12px;
+	line-height: 1.4;
+}
+.tp-note .tp-icon { display: none; width: 18px; height: 18px; color: var(--tp-muted); }
+.tp-inline-link {
+	border: none;
+	background: none;
+	padding: 0;
+	color: var(--tp-primary);
+	font: inherit;
+	font-weight: 600;
+	cursor: pointer;
 }
 
 .tp-warning {
@@ -175,42 +296,14 @@ body {
 	font-size: 13px;
 }
 
-/* ── Scope ──────────────────────────────────────────────────────────────── */
-.tp-scope {
-	margin: 0;
-	padding: 0;
-	border: none;
-	display: grid;
-	gap: 6px;
-}
-.tp-scope-legend {
-	padding: 0;
-	margin-bottom: 4px;
-	font-size: 13px;
-	font-weight: 600;
-	color: var(--tp-muted);
-}
-.tp-radio {
-	display: flex;
-	align-items: center;
-	gap: 10px;
-	font-size: 14px;
-	min-height: 32px;
-	cursor: pointer;
-}
-.tp-radio input {
-	width: 18px;
-	height: 18px;
-	margin: 0;
-	accent-color: var(--tp-primary);
-}
-
 /* ── Location preview + CTA ─────────────────────────────────────────────── */
+/* Label above value: always two rows, so a long value never wraps the
+   line and changes the sheet's height. */
 .tp-location {
 	display: flex;
-	flex-wrap: wrap;
-	align-items: baseline;
-	gap: 4px 10px;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 4px;
 	font-size: 12px;
 	color: var(--tp-muted);
 }
@@ -222,6 +315,7 @@ body {
 	padding: 2px 6px;
 	border-radius: 6px;
 }
+.tp-location-empty { color: var(--tp-muted); }
 
 .tp-continue {
 	width: 100%;
@@ -238,11 +332,13 @@ body {
 }
 .tp-continue:active:not(:disabled) { transform: scale(0.99); }
 .tp-continue:disabled {
-	opacity: 0.45;
+	background: var(--tp-disabled-bg);
+	color: var(--tp-muted);
 	cursor: not-allowed;
 }
 .tp-continue:focus-visible,
-.tp-link:focus-visible {
+.tp-link:focus-visible,
+.tp-inline-link:focus-visible {
 	outline: 2px solid var(--tp-primary);
 	outline-offset: 2px;
 }
@@ -263,6 +359,14 @@ body {
 		border-top: none;
 		border-left: 1px solid var(--tp-border);
 		align-content: start;
-		padding-top: 16px;
+		gap: 16px;
+		padding: 20px;
 	}
+	/* The side panel doesn't resize the map — no fixed slot needed. */
+	.tp-selection { min-height: 0; }
+	.tp-note { margin-top: 8px; padding: 8px 10px; font-size: 13px; }
+	.tp-note .tp-icon { display: block; }
+	.tp-scope { grid-template-columns: 1fr; }
+	.tp-option { font-size: 15px; padding: 12px 14px; }
+	.tp-banner { top: 16px; padding: 8px 16px; font-size: 14px; }
 }

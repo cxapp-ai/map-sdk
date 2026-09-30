@@ -25,6 +25,7 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "dev": "vite --config demo/vite.config.ts",
     "pages": "vite --config pages/vite.config.ts",
+    "build:pages": "npm run build && node scripts/build-moo-pages.mjs",
     "prepare": "npm run build"
   },
   "keywords": [

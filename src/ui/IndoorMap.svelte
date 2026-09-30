@@ -158,6 +158,8 @@
 		floorSelectorStyle?: 'auto' | 'tabs' | 'dropdown';
 		/** List every venue floor + allow an empty resource set (engine allFloors). */
 		allFloors?: boolean;
+		/** Draw the venue's amenity icons (engine showAmenityIcons). */
+		showAmenityIcons?: boolean;
 		/** Floor (mapId) to open on, when it is one of the listed floors. */
 		initialFloor?: number;
 		strings?: Partial<MapStrings>;
@@ -191,6 +193,7 @@
 		showFloorSelector = 'auto',
 		floorSelectorStyle = 'auto',
 		allFloors = false,
+		showAmenityIcons = false,
 		// Renamed: the mount effect has a local `initialFloor` for its floor pick.
 		initialFloor: initialFloorProp,
 		strings,
@@ -251,6 +254,9 @@
 	let selection = $state.raw<MapSelection | null>(null);
 	// Viewport position of the selection pin; reprojected every frame like pins.
 	let selectionPos = $state.raw<{ x: number; y: number } | null>(null);
+	// setSelectionVisible(false): pin + outline hidden, selection kept (e.g. a
+	// picker's "entire floor" mode). The next tap shows its selection again.
+	let selectionHidden = $state(false);
 	let unregisterTap: (() => void) | null = null;
 
 	// Live-GPS options (`gps`: bool | GpsOptions).
@@ -469,8 +475,9 @@
 		// tearing down + re-initing the whole engine (a ≥1.3s rebuild for a
 		// pure rename). kioskCoordinate stays in the signature (it changes the
 		// synthetic route start / kiosk-first floor selection — a genuine rebuild).
-		// allFloors changes the engine's floor list — a genuine rebuild.
-		+ '|cfg:' + JSON.stringify({ v: provider.venueId, k: provider.kioskCoordinate, a: allFloors }),
+		// allFloors changes the engine's floor list, showAmenityIcons what it
+		// draws at init — genuine rebuilds.
+		+ '|cfg:' + JSON.stringify({ v: provider.venueId, k: provider.kioskCoordinate, a: allFloors, i: showAmenityIcons }),
 	);
 
 	// Reactive floor-label overlay for the floor strip. The engine bakes
@@ -547,6 +554,7 @@
 					// via untrack — a change shouldn't reactively rebuild here.
 					autoReroute: untrack(() => autoReroute),
 					allFloors: untrack(() => allFloors),
+					showAmenityIcons: untrack(() => showAmenityIcons),
 					// Show the host's opening floor first instead of rendering +
 					// settling the dominant floor and then switching.
 					initialMapId: untrack(() => initialFloorProp),
@@ -1981,11 +1989,13 @@
 		return projectStart(inst, sel && { mapId: sel.mapId, worldX: sel.tapWorldX, worldY: sel.tapWorldY });
 	}
 
-	// Room outline for the current selection (off with highlight: false).
+	// Room outline for the current selection (off with highlight: false, or
+	// while setSelectionVisible(false)).
 	function applyHighlight(inst: MinimapInstance | null, sel: MapSelection | null): void {
 		if (!inst) return;
 		const hl = untrack(() => locSel?.highlight);
-		inst.highlightSelection(hl === false ? null : sel, typeof hl === 'object' ? hl : undefined);
+		const off = hl === false || untrack(() => selectionHidden);
+		inst.highlightSelection(off ? null : sel, typeof hl === 'object' ? hl : undefined);
 	}
 
 	// The engine bakes floor labels at build time; a runtime
@@ -2017,6 +2027,7 @@
 		// selection and still notifies the host — a picker wants to know the
 		// user tapped empty floor.
 		const next = inst.resolveLocation(tap, opts);
+		selectionHidden = false;
 		selection = next;
 		selectionPos = projectSelection(inst);
 		applyHighlight(inst, next);
@@ -2033,6 +2044,19 @@
 		dropSelection();
 	}
 
+	/**
+	 * Location-select: hide / re-show the selection pin and room outline
+	 * without dropping the selection (no event). The next tap shows its new
+	 * selection again.
+	 */
+	export function setSelectionVisible(visible: boolean): void {
+		selectionHidden = !visible;
+		const sel = untrack(() => selection);
+		// Hiding clears the outline wherever it is; showing re-applies it only
+		// on the selection's own floor (a floor switch re-applies it there).
+		if (mm && (!visible || (sel && sel.mapId === untrack(() => selectedMapId)))) applyHighlight(mm, sel);
+	}
+
 	/** Listed floors, with any runtime floorLabels override applied. */
 	export function getFloors(): FloorSummary[] {
 		const base = mm?.listFloors() ?? [];
@@ -2046,7 +2070,7 @@
 		{#if load === 'ready' && !switchingFloor}
 			{@render pinList(positions)}
 			{@render routeStartMarker(startPos)}
-			{#if locSel && locSel.showPin !== false}
+			{#if locSel && locSel.showPin !== false && !selectionHidden}
 				{@render selectionMarker(selectionPos)}
 			{/if}
 			{@render youAreHereMarker(gpsEnabled && !routeForcesNativeDot ? onMapPos(userOverlay) : null)}

@@ -28,7 +28,7 @@ import type {
 /** Imperative methods exported by the view component. */
 type IndoorMapExports = Pick<
 	IndoorMapHandle,
-	'confirmBooking' | 'focusResource' | 'setFloor' | 'getSelection' | 'clearSelection' | 'getFloors'
+	'confirmBooking' | 'focusResource' | 'setFloor' | 'getSelection' | 'clearSelection' | 'setSelectionVisible' | 'getFloors'
 >;
 
 /**
@@ -230,6 +230,7 @@ export function mountIndoorMap(
 		showFloorSelector: options.showFloorSelector ?? 'auto',
 		floorSelectorStyle: options.floorSelectorStyle ?? 'auto',
 		allFloors: options.allFloors ?? false,
+		showAmenityIcons: options.showAmenityIcons ?? false,
 		initialFloor: options.initialFloor,
 		strings: options.strings,
 		theme: options.theme,
@@ -274,6 +275,10 @@ export function mountIndoorMap(
 		clearSelection(): void {
 			if (destroyed) return;
 			api.clearSelection();
+		},
+		setSelectionVisible(visible: boolean): void {
+			if (destroyed) return;
+			api.setSelectionVisible(visible);
 		},
 		getFloors() {
 			return destroyed ? [] : api.getFloors();

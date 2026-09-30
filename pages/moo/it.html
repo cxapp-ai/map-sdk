@@ -2,7 +2,7 @@
 <!--
   MyMutual — Onsite Headquarters IT Incident: pick the location.
   MOO-598 (standalone minimap page, Approach 2). Identical to facilities.html
-  apart from data-ticket / the title — see that file for the load order and
+  apart from data-ticket and the copy — see that file for the load order and
   ticket-page.js for the behaviour.
 -->
 <html lang="en" data-ticket="it">
@@ -15,40 +15,60 @@
 <body>
 	<header class="tp-header">
 		<h1 class="tp-title" id="tp-title">Onsite Headquarters IT Incident</h1>
-		<p class="tp-hint" id="tp-hint">Pick the floor, then tap the space or amenity the incident is about.</p>
+		<p class="tp-hint">Choose whether the incident affects a specific space or the entire floor.</p>
 	</header>
 
+	<!-- The SDK needs a SIZED container at mount; the grid row gives it one. -->
 	<main class="tp-map-wrap">
 		<div id="tp-map" class="tp-map" aria-label="Floor map"></div>
+		<!-- What a tap does right now (mirrors the choice below; visual only). -->
+		<div class="tp-banner" id="tp-banner" aria-hidden="true" hidden></div>
 		<div id="tp-error" class="tp-error" role="alert" hidden></div>
 	</main>
 
 	<form class="tp-sheet" id="tp-form" autocomplete="off">
+		<fieldset class="tp-scope">
+			<legend class="tp-scope-legend">What does this incident cover?</legend>
+			<label class="tp-option">
+				<input type="radio" name="scope" value="space" checked />
+				<span>At or near a specific space</span>
+			</label>
+			<label class="tp-option">
+				<input type="radio" name="scope" value="floor" />
+				<span>The entire floor</span>
+			</label>
+		</fieldset>
+
 		<section class="tp-selection" aria-live="polite">
-			<div class="tp-selection-empty" id="tp-empty">Nothing selected yet — tap a space on the map.</div>
-			<div class="tp-selection-card" id="tp-card" hidden>
-				<div class="tp-selection-kind" id="tp-kind"></div>
-				<div class="tp-selection-name" id="tp-name"></div>
-				<dl class="tp-selection-meta">
+			<!-- A specific space, nothing tapped yet -->
+			<div class="tp-prompt" id="tp-empty">
+				<svg class="tp-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11.24V7.5a2.5 2.5 0 0 1 5 0v3.74c1.21-.81 2-2.18 2-3.74C16 5.01 13.99 3 11.5 3S7 5.01 7 7.5c0 1.56.79 2.93 2 3.74zm9.84 4.63-4.54-2.26a1.4 1.4 0 0 0-.54-.11H13v-6c0-.83-.67-1.5-1.5-1.5S10 6.67 10 7.5v10.74l-3.43-.72a1.1 1.1 0 0 0-.24-.03c-.31 0-.59.13-.79.33l-.79.8 4.94 4.94c.27.27.65.44 1.06.44h6.79c.75 0 1.33-.55 1.44-1.28l.75-5.27c.01-.07.02-.14.02-.2 0-.62-.38-1.16-.91-1.38z"/></svg>
+				<span>Tap the map to choose the space the incident is about.</span>
+			</div>
+			<!-- A specific space, selected -->
+			<div class="tp-card" id="tp-card" hidden>
+				<div class="tp-card-kind" id="tp-kind"></div>
+				<button type="button" class="tp-link" id="tp-clear">Clear</button>
+				<div class="tp-card-name" id="tp-name"></div>
+				<dl class="tp-card-meta">
 					<div><dt>Floor</dt><dd id="tp-floor">—</dd></div>
 					<div><dt>Space code</dt><dd id="tp-code">—</dd></div>
 				</dl>
-				<button type="button" class="tp-link" id="tp-clear">Clear selection</button>
+			</div>
+			<!-- The entire floor -->
+			<div class="tp-card" id="tp-floor-card" hidden>
+				<div class="tp-card-kind">Entire floor</div>
+				<div class="tp-card-name" id="tp-floor-name"></div>
+				<dl class="tp-card-meta">
+					<div><dt>Building</dt><dd id="tp-building">—</dd></div>
+				</dl>
+				<p class="tp-note" id="tp-pin-note" hidden>
+					<svg class="tp-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>
+					<span>Your map pin at <b id="tp-pin-name"></b> won't be included. Switch back to <button type="button" class="tp-inline-link" id="tp-use-pin">a specific space</button> to use it.</span>
+				</p>
 			</div>
 			<p class="tp-warning" id="tp-warning" hidden></p>
 		</section>
-
-		<fieldset class="tp-scope">
-			<legend class="tp-scope-legend">Where is the issue?</legend>
-			<label class="tp-radio">
-				<input type="radio" name="scope" value="space" checked />
-				<span>Exactly at the selected space</span>
-			</label>
-			<label class="tp-radio">
-				<input type="radio" name="scope" value="floor" />
-				<span>Anywhere on this floor</span>
-			</label>
-		</fieldset>
 
 		<div class="tp-location">
 			<span class="tp-location-label">Location sent to ServiceNow</span>

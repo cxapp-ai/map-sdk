@@ -29,34 +29,33 @@ window.MOO_TICKET_CONFIG = {
 	initialFloor: undefined,
 
 	// ── location_on_floor_plan ────────────────────────────────────────────
-	// Format: "<building>, <floor>, <space code>" (comma + space), or
-	// "<building>, <floor>" for "anywhere on this floor" / no code.
-	// Floor format + no-code rule follow Frank on MOO-598 (2026-09-24); the
-	// space code source is our choice pending his OK (see spaceCodeSource).
+	// The `servicenow=` value from the map data (serviceNowKey below), else
+	// the default "<building>, <floor>, <space code>" (comma + space), or
+	// "<building>, <floor>" for "The entire floor" / no code. Floor = the
+	// floor number only (Daniel, MOO-598 2026-09-24); no-code rule per Frank
+	// (same day).
 	building: 'HQ',
 
-	// Whole location string from one Jibestream custom property, when the
-	// venue has it configured (Frank). Unset / missing → generated as below.
-	locationProperty: undefined, // e.g. 'Location On Floor Plan'
+	// Where the location comes from (Frank, MOO-598 2026-09-29/30): the
+	// Jibestream External ID holds `key=value` pairs split by ";", e.g.
+	// "zoneId=123;servicenow=HQ, 43, 43C08C". The `servicenow=` value is the
+	// full location string, sent as-is: from the tapped item's waypoint (else
+	// the destination / amenity), or from the floor for the entire floor.
+	// Everything else in the External ID is ignored. When there is none, the
+	// page generates the default below.
+	serviceNowKey: 'servicenow',
 
-	// Floor component. 'name' = the Jibestream floor name as-is ("Floor 44" —
-	// Frank's choice); 'shortName' = Floor.shortName ("44", the Confluence
-	// example). floorCodes overrides either, per Jibestream mapId.
-	floorCodeSource: 'name',
+	// Floor component. 'shortName' = Floor.shortName, the floor number only
+	// ("43" — Daniel, MOO-598 2026-09-24: "HQ, 43, 43C08C"); 'name' = the
+	// Jibestream floor name as-is ("Floor 43"). floorCodes overrides either,
+	// per Jibestream mapId.
+	floorCodeSource: 'shortName',
 	floorCodes: undefined, // e.g. { 8869: '44' }
 
-	// Space component, first match wins:
-	//   spaceCodeProperty — a Jibestream custom property key (Frank: "space
-	//     code would be a property"). Mutual HQ has none today: 3 of 3826
-	//     destinations carry any property ("Filter Category").
-	//   spaceCodeSource — 'namePrefix' (default: the first word of the name
-	//     that contains a digit — "17N11 Conference" → "17N11", "IDF 19N04" →
-	//     "19N04", "Dock Office1C14" → "1C14"; 3824 of 3826 Mutual names),
-	//     'externalId' (4 of 3826 at Mutual), 'name', or 'none' (codes only
-	//     from spaceCodeProperty — use once Mutual has a code property).
-	//     namePrefix is our choice, not Frank's: he asked for a property, but
-	//     Mutual has none today. Pending his confirmation on MOO-598.
-	spaceCodeProperty: undefined, // e.g. 'Space Code'
+	// Space component of the default: 'namePrefix' (the first word of the
+	// name that contains a digit — "17N11 Conference" → "17N11", "IDF 19N04"
+	// → "19N04", "Dock Office1C14" → "1C14"; 3824 of 3826 Mutual names),
+	// 'name' (the whole name), or 'none' (no code → missingCodePolicy).
 	spaceCodeSource: 'namePrefix',
 	spaceCodePattern: undefined, // regex string, capture group 1 = code (namePrefix only)
 	// No code found: 'floor' (send "<building>, <floor>" — Frank), 'name' (use
@@ -84,8 +83,11 @@ window.MOO_TICKET_CONFIG = {
 	// Ignore taps farther than this from any selectable item (map units;
 	// roughly floor-plan pixels). Leave undefined for no limit.
 	maxSnapDistance: undefined,
-	// Keep "Anywhere on this floor" checked when the user taps a space
-	// (default: a tap switches back to "Exactly at the selected space").
+	// Which "What does this request cover?" option starts selected: 'space'
+	// ("At or near a specific space") or 'floor' ("The entire floor").
+	defaultScope: 'space',
+	// Keep "The entire floor" selected when the user taps the map (default: a
+	// tap switches to "At or near a specific space").
 	keepScopeOnSelect: false,
 
 	// ── ServiceNow (the ticket form) ──────────────────────────────────────
@@ -112,6 +114,15 @@ window.MOO_TICKET_CONFIG = {
 			},
 		},
 	},
+
+	// Draw Jibestream's amenity icons (restrooms, printers…) on the map.
+	showAmenityIcons: true,
+
+	// Where Continue opens the ServiceNow form: 'auto' (this page; when
+	// embedded in an iframe, the whole top page — ServiceNow usually refuses
+	// to load in a frame), 'self' (always this page / frame), or 'none' (only
+	// post the `continue` message; the embedding page navigates).
+	continueTarget: 'auto',
 
 	// targetOrigin for messages posted to an embedding parent page (the SDK
 	// event mirror + the `continue` hand-off). Set it to the support page's

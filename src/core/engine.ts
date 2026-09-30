@@ -243,6 +243,7 @@ interface JController {
 	showMap?: (map: unknown) => void;
 	getUnitsFromDestination?: (dest: unknown) => unknown[];
 	getUnitsFromMap?: (map: unknown) => unknown[];
+	getShapesInLayer?: (layerName: string, map: unknown) => unknown[];
 	getViewportPointFromMapPoint?: (point: [number, number]) => [number, number];
 	addDragPan?: () => void;
 	addPinchZoom?: () => void;
@@ -268,6 +269,7 @@ interface JController {
 	renderCurrentMapView?: () => unknown;
 	_getParsedMapView?: (map: unknown) => MapViewLike | undefined;
 	showAllPathTypes?: () => void;
+	showAllAmenities?: () => unknown;
 	// Tap plumbing (jmap.js v4). enableGenericTapHandler REPLACES the single
 	// generic-tap slot; the callback's event carries `localPoint` = [x, y] in
 	// the current map's local (world) frame, set by the stage's hit-test.
@@ -445,6 +447,11 @@ function ensureNavigationKitLoading(logger?: MapLogger): void {
 
 // --- Geometry helpers ---------------------------------------------------------
 
+// A Jibestream id-ish field as a string; null when unset or ''.
+function nonEmptyString(v: unknown): string | null {
+	return v != null && v !== '' ? String(v) : null;
+}
+
 function readPoint(p: unknown): { x: number; y: number } | null {
 	if (Array.isArray(p) && typeof p[0] === 'number' && typeof p[1] === 'number') {
 		return { x: p[0], y: p[1] };
@@ -456,7 +463,9 @@ function readPoint(p: unknown): { x: number; y: number } | null {
 	return null;
 }
 
-function unitCenterFromPoints(u: unknown): { x: number; y: number } | null {
+// Axis-aligned bounds of a JMap shape's `points` (world coords); null when
+// it has none.
+function shapeBounds(u: unknown): UnitBounds | null {
 	const pts = (u as { points?: unknown }).points;
 	if (!Array.isArray(pts)) return null;
 	let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -470,8 +479,12 @@ function unitCenterFromPoints(u: unknown): { x: number; y: number } | null {
 		if (pt.x > maxX) maxX = pt.x;
 		if (pt.y > maxY) maxY = pt.y;
 	}
-	if (!saw) return null;
-	return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+	return saw ? { x: minX, y: minY, width: maxX - minX, height: maxY - minY } : null;
+}
+
+function unitCenterFromPoints(u: unknown): { x: number; y: number } | null {
+	const b = shapeBounds(u);
+	return b ? { x: b.x + b.width / 2, y: b.y + b.height / 2 } : null;
 }
 
 // Read a JMap Waypoint's world coordinate. jmap.js v4 exposes it directly
@@ -570,6 +583,8 @@ export interface CreateMinimapOpts {
 	 * when shown. Default false (historical: pin floors only, pins-desc).
 	 */
 	allFloors?: boolean;
+	/** Draw the venue's amenity icons (Jibestream amenity art). Default false. */
+	showAmenityIcons?: boolean;
 	/**
 	 * Floor (mapId) to show first, when it is a listed floor; otherwise the
 	 * floor with the most pins. Passing the host's opening floor here avoids
@@ -973,6 +988,12 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		catch (e) { jibLog('minimap', 'showAllPathTypes threw', e); }
 	}
 
+	// Amenity icons (restrooms, printers…) — opt-in; JMap leaves them hidden.
+	if (opts.showAmenityIcons && typeof control.showAllAmenities === 'function') {
+		try { control.showAllAmenities(); }
+		catch (e) { jibLog('minimap', 'showAllAmenities threw', e); }
+	}
+
 	// Enable pan + zoom. These are no-arg toggles in jmap.js v4.
 	for (const fn of ['addDragPan', 'addPinchZoom', 'addMouseWheelZoom'] as const) {
 		const m = control[fn];
@@ -1039,6 +1060,8 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		shortName: string | number | null;
 		level: number | null;
 		elevation: number | null;
+		/** Floor.externalId from the CMS; null when unset. */
+		externalId: string | null;
 		/** False when the map belongs to no building floor (e.g. a venue-level map). */
 		isFloor: boolean;
 	};
@@ -1048,13 +1071,13 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	function floorMeta(mapId: number): FloorMeta {
 		const hit = floorMetaCache.get(mapId);
 		if (hit) return hit;
-		const out: FloorMeta = { name: null, shortName: null, level: null, elevation: null, isFloor: false };
+		const out: FloorMeta = { name: null, shortName: null, level: null, elevation: null, externalId: null, isFloor: false };
 		floorMetaCache.set(mapId, out);
 		const mapObj = mapsColl?.getById?.(mapId);
 		if (!mapObj) return out;
 		try {
 			const fl = buildingsColl?.getFloorByMap?.(mapObj) as
-				| { name?: unknown; shortName?: unknown; level?: unknown; elevation?: unknown }
+				| { name?: unknown; shortName?: unknown; level?: unknown; elevation?: unknown; externalId?: unknown; _?: { externalId?: unknown } }
 				| null
 				| undefined;
 			if (fl) {
@@ -1064,6 +1087,8 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 				else if (typeof fl.shortName === 'string' && fl.shortName.trim()) out.shortName = fl.shortName.trim();
 				if (typeof fl.level === 'number') out.level = fl.level;
 				if (typeof fl.elevation === 'number') out.elevation = fl.elevation;
+				// No typed getter on every jmap build — fall back to the raw bag.
+				out.externalId = nonEmptyString(fl.externalId ?? fl._?.externalId);
 			}
 		} catch (e) {
 			jibLog('minimap', 'getFloorByMap threw', e);
@@ -1307,17 +1332,26 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		opts.onViewChange?.();
 	}
 
-	// Building footprint per floor (union of the unit centres) — preferred
-	// over the full map extent, which usually includes a lot of outdoor
-	// surroundings that would leave the building small in the viewport.
+	// Building footprint per floor — preferred over the full map extent, which
+	// usually includes a lot of outdoor surroundings that would leave the
+	// building small in the viewport. The Jibestream "Boundary" layer (the
+	// building outline) when the floor has one, else the union of the unit
+	// centres. Unit centres alone frame one corner on floors with few room
+	// polygons (Mutual HQ: Basement 3, Floor 15 2, Floor 44 14).
 	// Cached: the venue never changes, and resizes re-frame often.
 	const footprintCache = new Map<number, UnitBounds | null>();
 	function floorFootprint(mapId: number): UnitBounds | null {
 		if (footprintCache.has(mapId)) return footprintCache.get(mapId) ?? null;
 		const pts: Array<{ worldX: number; worldY: number }> = [];
-		for (const u of unitsOn(mapId)) {
-			const c = unitCenterFromPoints(u);
-			if (c) pts.push({ worldX: c.x, worldY: c.y });
+		for (const shape of shapesIn(mapId, 'boundary')) {
+			const b = shapeBounds(shape);
+			if (b) pts.push({ worldX: b.x, worldY: b.y }, { worldX: b.x + b.width, worldY: b.y + b.height });
+		}
+		if (pts.length === 0) {
+			for (const u of unitsOn(mapId)) {
+				const c = unitCenterFromPoints(u);
+				if (c) pts.push({ worldX: c.x, worldY: c.y });
+			}
 		}
 		const size = floorSizeWorld(mapId);
 		const rect = pts.length >= 2 ? rectFromPoints(pts)
@@ -1333,6 +1367,15 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		if (!rect) return;
 		fitView(rect, Math.max(24, Math.max(rect.width, rect.height) * 0.15), 'frameWholeFloor');
 		opts.onViewChange?.();
+	}
+
+	// Shapes of one JMap layer on a floor (name matched case-insensitively),
+	// [] when the floor has no such layer.
+	function shapesIn(mapId: number, layerName: string): unknown[] {
+		const mapObj = mapsColl?.getById?.(mapId);
+		if (!mapObj || typeof control.getShapesInLayer !== 'function') return [];
+		try { return control.getShapesInLayer(layerName, mapObj) ?? []; }
+		catch (e) { jibLog('minimap', `getShapesInLayer(${layerName}) threw`, e); return []; }
 	}
 
 	// Unit polygons of a floor (JMap "units" layer), [] when unavailable.
@@ -2117,7 +2160,7 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		_?: Record<string, unknown>;
 		export?: () => unknown;
 	};
-	type JWaypoint = { id?: number; mapId?: number; _?: Record<string, unknown>; export?: () => unknown };
+	type JWaypoint = { id?: number; mapId?: number; externalId?: unknown; _?: Record<string, unknown>; export?: () => unknown };
 
 	// JMap has ONE generic-tap slot (each enableGenericTapHandler call replaces
 	// it), so register with JMap once and fan out to our own listener set.
@@ -2305,10 +2348,11 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 			kind,
 			mapId,
 			name: model?.name ?? null,
-			externalId: model?.externalId != null && model.externalId !== '' ? String(model.externalId) : null,
+			externalId: nonEmptyString(model?.externalId),
 			destinationId: !isAmenity && typeof model?.id === 'number' ? model.id : null,
 			amenityId: isAmenity && typeof model?.id === 'number' ? model.id : null,
 			waypointId: typeof wp?.id === 'number' ? wp.id : null,
+			waypointExternalId: nonEmptyString(wp?.externalId ?? wp?._?.externalId),
 			keywords: Array.isArray(model?.keywords) ? model.keywords.map(String) : [],
 			tags: Array.isArray(model?.tags) ? model.tags.map(String) : [],
 			properties: modelProperties(model),
@@ -2336,6 +2380,7 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 			floorName: floor?.mapName ?? cfg.floorLabels?.[world.mapId] ?? floorBaseName(world.mapId),
 			floorShortName: fm.shortName,
 			floorLevel: fm.level,
+			floorExternalId: fm.externalId,
 			venueId: cfg.venueId,
 			worldX: item.x,
 			worldY: item.y,
@@ -2489,6 +2534,7 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 				name: f.mapName,
 				shortName: fm.shortName,
 				level: fm.level,
+				externalId: fm.externalId,
 				hasPins: f.pins.length > 0,
 			};
 		});
