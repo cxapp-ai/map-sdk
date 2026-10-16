@@ -244,10 +244,9 @@ export function clearJibestreamCaches(): void {
 	caches.clear();
 	// Same discipline for the stored map data: a fetch still in flight, or a
 	// write already queued for idle time, must not refill the store after the
-	// clear (see saveJacs).
-	jacsGeneration++;
+	// clear (see saveJacs and clearJacsStore).
 	jacsInflight.clear();
-	void clearJacsStore();
+	clearJacsStore();
 }
 
 // --- Persistent JACS response cache -------------------------------------------
@@ -265,7 +264,8 @@ export function clearJibestreamCaches(): void {
 // (the tiny `generatedAt` validator, so the conditional request goes out
 // without first reading the body) and `body` (the text, parsed per caller).
 // Storage is best-effort: no IndexedDB (sandboxed iframe, private mode, quota)
-// just means plain network loads. `persistentCache: false` turns it off.
+// just means plain network loads, and a failed open is tried again after a
+// short cool-down. `persistentCache: false` turns it off.
 
 const JACS_DB = 'cxai-map-sdk';
 const META = 'meta';
@@ -275,25 +275,52 @@ const JACS_VERSION_QUERY = 'v=4.12';
 
 interface JacsMeta { generatedAt: number | string }
 
+// The open connection, or the open in progress. A failed or blocked open is
+// not kept: for JACS_DB_RETRY_MS every call gets null without trying (a page
+// with no usable IndexedDB doesn't reopen per call), then the next call opens
+// again (a transient UnknownError, a frame later granted storage).
 let jacsDbPromise: Promise<IDBDatabase | null> | null = null;
+let jacsDbRetryAt = 0;
+const JACS_DB_RETRY_MS = 10_000;
+
 function openJacsDb(): Promise<IDBDatabase | null> {
 	if (jacsDbPromise) return jacsDbPromise;
-	jacsDbPromise = new Promise<IDBDatabase | null>((resolve) => {
+	if (Date.now() < jacsDbRetryAt) return Promise.resolve(null);
+	const forget = () => { if (jacsDbPromise === opened) jacsDbPromise = null; };
+	const opened: Promise<IDBDatabase | null> = new Promise<IDBDatabase | null>((resolve) => {
 		try {
 			if (typeof indexedDB === 'undefined') return resolve(null);
 			const req = indexedDB.open(JACS_DB, 1);
+			let settled = false;
 			req.onupgradeneeded = () => {
 				req.result.createObjectStore(META);
 				req.result.createObjectStore(BODY);
 			};
-			req.onsuccess = () => resolve(req.result);
-			req.onerror = () => resolve(null);
-			req.onblocked = () => resolve(null);
+			req.onsuccess = () => {
+				const db = req.result;
+				if (settled) return db.close(); // a blocked open that got through later
+				settled = true;
+				// Another tab upgrading or deleting the database, or the browser
+				// dropping the connection: let go of it so the next call reopens.
+				db.onversionchange = () => { db.close(); forget(); };
+				db.onclose = forget;
+				flushJacsClear(db); // ahead of every caller's transaction
+				resolve(db);
+			};
+			req.onerror = () => { settled = true; resolve(null); };
+			req.onblocked = () => { settled = true; resolve(null); };
 		} catch {
 			resolve(null);
 		}
+	}).then((db) => {
+		if (!db) {
+			forget();
+			jacsDbRetryAt = Date.now() + JACS_DB_RETRY_MS;
+		}
+		return db;
 	});
-	return jacsDbPromise;
+	jacsDbPromise = opened;
+	return opened;
 }
 
 // Runs `run` in one transaction over `stores`; resolves with its request's
@@ -320,16 +347,38 @@ function jacsTx<T>(
 const readMeta = (url: string) => jacsTx<JacsMeta>([META], 'readonly', (tx) => tx.objectStore(META).get(url));
 const readBody = (url: string) => jacsTx<string>([BODY], 'readonly', (tx) => tx.objectStore(BODY).get(url));
 
-function clearJacsStore(): Promise<unknown> {
-	return jacsTx([META, BODY], 'readwrite', (tx) => {
-		tx.objectStore(META).clear();
-		tx.objectStore(BODY).clear();
-	});
+// Bumped by clearJacsStore. A fetch captures it when it starts, and its write
+// is dropped if a clear happened since.
+let jacsGeneration = 0;
+
+// Set by a clear until its transaction exists. A clear that finds no database
+// (open failed or cooling down, connection closing) stays pending and runs as
+// the first transaction of the next successful open, so a copy the page could
+// not reach at clear time is still gone before anything reads it.
+let jacsClearPending = false;
+
+// Readwrite transactions over the same stores run in the order they are
+// created. The generation moves on synchronously here, and saveJacs reads it
+// in the same turn it creates its transaction, so a write either comes before
+// the clear's transaction (and is wiped by it) or sees the new generation and
+// writes nothing.
+function clearJacsStore(): void {
+	jacsGeneration++;
+	jacsClearPending = true;
+	void openJacsDb().then((db) => { if (db) flushJacsClear(db); });
 }
 
-// Bumped by clearJibestreamCaches. A fetch captures it when it starts, and its
-// write is dropped if a clear happened since.
-let jacsGeneration = 0;
+function flushJacsClear(db: IDBDatabase): void {
+	if (!jacsClearPending) return;
+	try {
+		const tx = db.transaction([META, BODY], 'readwrite');
+		tx.objectStore(META).clear();
+		tx.objectStore(BODY).clear();
+		jacsClearPending = false;
+	} catch {
+		// Connection closing: stays pending for the next open.
+	}
+}
 
 // Writes the copy once the browser is idle — structured-cloning a 54 MB string
 // competes with the first render otherwise. Body and validator go in one
@@ -338,8 +387,10 @@ function saveJacs(url: string, text: string, generation: number): void {
 	const generatedAt = generatedAtOf(text);
 	if (generatedAt == null) return; // nothing to revalidate with
 	const write = () => {
-		if (generation !== jacsGeneration) return; // cleared since the fetch began
 		void jacsTx([META, BODY], 'readwrite', (tx) => {
+			// Checked as the transaction is created, not before the database
+			// open resolves (see clearJacsStore).
+			if (generation !== jacsGeneration) return; // cleared since the fetch began
 			tx.objectStore(BODY).put(text, url);
 			tx.objectStore(META).put({ generatedAt } satisfies JacsMeta, url);
 		});
