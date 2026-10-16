@@ -242,6 +242,11 @@ export function clearJibestreamCaches(): void {
 		entry.venuePromise = null;
 	}
 	caches.clear();
+	// Same discipline for the stored map data: a fetch still in flight, or a
+	// write already queued for idle time, must not refill the store after the
+	// clear (see saveJacs).
+	jacsGeneration++;
+	jacsInflight.clear();
 	void clearJacsStore();
 }
 
@@ -322,13 +327,18 @@ function clearJacsStore(): Promise<unknown> {
 	});
 }
 
+// Bumped by clearJibestreamCaches. A fetch captures it when it starts, and its
+// write is dropped if a clear happened since.
+let jacsGeneration = 0;
+
 // Writes the copy once the browser is idle — structured-cloning a 54 MB string
 // competes with the first render otherwise. Body and validator go in one
 // transaction, so a validator never points at a missing or older body.
-function saveJacs(url: string, text: string): void {
+function saveJacs(url: string, text: string, generation: number): void {
 	const generatedAt = generatedAtOf(text);
 	if (generatedAt == null) return; // nothing to revalidate with
 	const write = () => {
+		if (generation !== jacsGeneration) return; // cleared since the fetch began
 		void jacsTx([META, BODY], 'readwrite', (tx) => {
 			tx.objectStore(BODY).put(text, url);
 			tx.objectStore(META).put({ generatedAt } satisfies JacsMeta, url);
@@ -380,6 +390,7 @@ export function fetchJacsText(cfg: JibestreamConfig, url: string, logger?: MapLo
 	if (hit) return hit;
 	const jibLog = makeJibLog(logger);
 	const useStore = cfg.persistentCache !== false;
+	const generation = jacsGeneration;
 	const p = (async () => {
 		const [meta, token] = await Promise.all([
 			useStore ? readMeta(url) : Promise.resolve(null),
@@ -411,7 +422,7 @@ export function fetchJacsText(cfg: JibestreamConfig, url: string, logger?: MapLo
 			throw new Error(`Jibestream fetch failed: ${res.status} ${url.replace(/\?.*$/, '')}`);
 		}
 		const text = await res.text();
-		if (useStore) saveJacs(url, text);
+		if (useStore) saveJacs(url, text, generation);
 		return text;
 	})();
 	jacsInflight.set(url, p);
