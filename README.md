@@ -325,6 +325,17 @@ No backend endpoints are called by the SDK itself beyond Jibestream. Strings
 English/current-look defaults. Styles ship inside the JS bundles and
 self-inject — there is no stylesheet to import.
 
+**Map data cache.** The SDK fetches the venue and building `/full` JSON itself
+(once each, the building as soon as its id is known) and hands them to JMap,
+which then skips its own requests. Both are kept in IndexedDB
+(`cxai-map-sdk`) and revalidated with `If-Modified-Since: <generatedAt>`, so
+an unchanged venue costs two 304s instead of the full download. This matters
+because the building response carries every floor's SVG, uncompressed (54 MB
+at Mutual of Omaha HQ). Tokens are never stored. With no IndexedDB (sandboxed
+iframe, blocked storage) it falls back to plain network loads; set
+`provider.persistentCache: false` to never store map data on the device.
+`clearJibestreamCaches()` also empties it.
+
 Jibestream token/venue caches are keyed per config **including auth
 identity** (the `getToken` callback / `clientId`), so remounting with
 different credentials never reuses a previous user's token. The cache is
@@ -386,7 +397,7 @@ npm run check    # svelte-check
 npm run dev      # demo app (demo/, needs VITE_JIBESTREAM_* creds — never commit secrets)
 ```
 
-`jmap.js` is pinned **exactly** (4.14.1): the engine relies on undocumented
+`jmap.js` is pinned **exactly** (4.18.0): the engine relies on undocumented
 JMap internals; treat any bump as a breaking change and re-run the demo
 smoke test against a live venue.
 

@@ -17,6 +17,10 @@ import {
 	type Destination,
 	type VenueData,
 	loadVenue,
+	fetchVenueJson,
+	fetchBuildingJson,
+	defaultBuildingIdOf,
+	storedDefaultBuildingId,
 	resolveDestination,
 	getToken,
 	peekTokenExpiry,
@@ -210,8 +214,16 @@ async function buildHostTokenAuth(
 	return { auth, dispose, start };
 }
 
+// JMap's ActiveVenue — only what the populate sequence reads.
+interface JActiveVenue {
+	buildings: { getDefault: () => { id?: number } | undefined };
+}
+
 interface JCore {
-	populateVenueWithDefaultBuilding: (venueId: number, cb: (err: unknown, av: unknown) => void) => void;
+	// The optional last argument is prefetched `/full` JSON: when given, JMap
+	// uses it instead of requesting the URL itself.
+	populateVenueByVenueId: (venueId: number, cb: (err: unknown, av: unknown) => void, venueData?: unknown) => void;
+	populateBuildingInVenue: (av: JActiveVenue, buildingId: number | undefined, cb: (err: unknown) => void, buildingData?: unknown) => void;
 }
 
 interface ActiveVenueLike {
@@ -759,6 +771,22 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	// surfaces at the `await jmapPromise` site (loadJmap is module-cached, so
 	// this attaches a second handler, not a second import).
 	jmapPromise.catch(() => {});
+	// The venue and building `/full` JSON are fetched here (IndexedDB copy +
+	// 304 revalidation, see fetchJacsText) and handed to JMap's populate
+	// calls, which then skip their own requests. The building — every floor's
+	// SVG, the bulk of the load — starts as soon as its id is known: from the
+	// stored venue copy on a repeat open (revalidating alongside the venue),
+	// else from the fetched venue — alongside the jmap.js chunk and JMap's
+	// template fetch instead of after them. Started before loadVenue so both
+	// share the one venue request. Any failure here falls back to JMap
+	// fetching for itself.
+	let rawVenueP: Promise<Record<string, unknown>> | null = fetchVenueJson(cfg, opts.logger);
+	const venueP = rawVenueP;
+	let buildingP: Promise<{ id: number; data: Record<string, unknown> } | null> | null = storedDefaultBuildingId(cfg)
+		.then((stored) => stored ?? venueP.then(defaultBuildingIdOf))
+		.then((id) => id == null ? null : fetchBuildingJson(cfg, id, opts.logger).then((data) => ({ id, data })));
+	rawVenueP.catch(() => {});
+	buildingP.catch(() => {});
 	const venue: VenueData = await loadVenue(cfg, opts.logger);
 
 	// Resolve resources → group by floor. Each item records HOW it resolved
@@ -881,12 +909,26 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	try {
 		core = new jmap.core.JCore(coreOpts);
 
-		activeVenue = await new Promise((resolve, reject) => {
-			core.populateVenueWithDefaultBuilding(cfg.venueId, (err, av) => {
+		// populateVenueWithDefaultBuilding, split so JMap takes the data
+		// fetched above (its third/fourth argument) instead of requesting it.
+		const rawVenue = await rawVenueP.catch((e) => { jibLog('minimap', 'venue prefetch failed — JMap fetches it', e); return undefined; });
+		rawVenueP = null;
+		const av = await new Promise<JActiveVenue>((resolve, reject) => {
+			core.populateVenueByVenueId(cfg.venueId, (err, v) => {
 				if (err) reject(err);
-				else resolve(av);
-			});
+				else resolve(v as JActiveVenue);
+			}, rawVenue);
 		});
+		const buildingId = (av.buildings.getDefault() || {}).id;
+		const prefetched = await buildingP.catch((e) => { jibLog('minimap', 'building prefetch failed — JMap fetches it', e); return null; });
+		buildingP = null;
+		await new Promise<void>((resolve, reject) => {
+			core.populateBuildingInVenue(av, buildingId, (err) => {
+				if (err) reject(err);
+				else resolve();
+			}, prefetched && prefetched.id === buildingId ? prefetched.data : undefined);
+		});
+		activeVenue = av;
 
 		control = new jmap.JController({
 			engine: 'canvas',
