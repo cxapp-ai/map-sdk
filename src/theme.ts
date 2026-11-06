@@ -19,6 +19,11 @@ import type { MapTheme } from './types.js';
  * The values below are the predominant fallback for each token. Setting a
  * token (via `options.theme` or a host stylesheet) overrides ALL usages of
  * it uniformly.
+ *
+ * Opt-in pin tokens, deliberately absent here (unset, their fallbacks keep
+ * the historical look): --map-pin-selected (selected pin body; falls back to
+ * the pin's --map-primary, #0070F0) and --map-pin-added (`added` resource
+ * pins; #0070F0).
  */
 export const DEFAULT_THEME: MapTheme = {
 	'--map-primary': '#6366f1',

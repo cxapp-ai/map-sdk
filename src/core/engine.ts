@@ -29,6 +29,8 @@ import type {
 	MapResource,
 	ColleagueBooking,
 	MapLogger,
+	FloorSummary,
+	MapSelection,
 } from '../types.js';
 
 export interface FloorInfo {
@@ -44,6 +46,15 @@ export interface PinInfo {
 	worldY: number;
 }
 
+/** A unit fill state (`MapResource.availability`). */
+export type AvailabilityState = NonNullable<MapResource['availability']>;
+
+/** The floor carrying this resource's pin (by host externalId), or null. */
+export function floorOfResource(floors: FloorInfo[], externalId: string | number): number | null {
+	const target = String(externalId);
+	return floors.find(f => f.pins.some(p => String(p.resource.externalId ?? '') === target))?.mapId ?? null;
+}
+
 export interface ColleagueMarker {
 	booking: ColleagueBooking;
 	/** Floor the colleague is booked on — host filters markers to current floor. */
@@ -56,6 +67,34 @@ export interface MinimapInstanceState {
 	floors: FloorInfo[];
 	dominantMapId: number | null;
 	unresolved: number;
+}
+
+/** What a map tap may select (see MinimapInstance.resolveTap). */
+export interface ResolveTapOpts {
+	/** Host filter over this floor's resource pins (e.g. by resource type). */
+	acceptPin: (pin: PinInfo) => boolean;
+	/** Also consider Jibestream amenities for the nearest-item step. */
+	amenities: boolean;
+	/** Nearest-item cap in metres; ignored when the floor has no scale. */
+	maxSnapMeters?: number;
+}
+
+/** A tap resolved to a resource pin or an amenity on the tapped floor. */
+export interface TapResolution {
+	kind: 'resource' | 'amenity';
+	mapId: number;
+	/** 'resource': index of the pin in that floor's `state.floors[].pins` (-1 for an amenity). */
+	pinIndex: number;
+	/** Amenity name (resources are named by the host resource). */
+	name: string | null;
+	/** Where the item is drawn (pin / amenity waypoint). */
+	worldX: number;
+	worldY: number;
+	/** The tap fell inside the resource's unit polygon. */
+	inside: boolean;
+	/** Tap → item in metres (0 inside); null when the floor has no scale. */
+	distanceMeters: number | null;
+	jibestream: MapSelection['jibestream'];
 }
 
 const MAP_SETTLE_MS = 600;
@@ -262,6 +301,13 @@ interface JController {
 	renderCurrentMapView?: () => unknown;
 	_getParsedMapView?: (map: unknown) => MapViewLike | undefined;
 	showAllPathTypes?: () => void;
+	// Shapes of one named layer of a parsed map ([] when the layer is absent).
+	// getUnitsFromMap is this with 'units'; taps also read 'Boundary' (the
+	// building outline).
+	getShapesInLayer?: (layerName: string, map: unknown) => unknown[];
+	// Unit styling (availability fills). styleShapes wants a real Array and
+	// a jmap.Style, and sets only the Style fields that are defined.
+	styleShapes?: (shapes: unknown[], style: unknown) => unknown;
 }
 
 interface UnitBounds { x: number; y: number; width: number; height: number; }
@@ -551,6 +597,37 @@ export interface CreateMinimapOpts {
 	 * pin-only mount that never draws a route also never hits the CDN.
 	 */
 	autoReroute?: boolean;
+	/**
+	 * List every venue floor (not just floors carrying a pin) and allow an
+	 * empty `resources` array. Floors are ordered as `floorOrder: 'building'`;
+	 * a pin-less floor is framed to its full footprint when shown. Default
+	 * false (historical: pin floors only, pins-desc).
+	 */
+	allFloors?: boolean;
+	/**
+	 * Floor order. 'pins' (default, historical): most pins first, then mapId.
+	 * 'building': Jibestream Floor level, then elevation, then a numeric
+	 * shortName, then mapId. `allFloors` always uses 'building'.
+	 */
+	floorOrder?: 'pins' | 'building';
+	/**
+	 * Floor (mapId) to show first, when it is a listed floor; otherwise the
+	 * floor with the most pins. Passing the host's opening floor here avoids
+	 * rendering + settling another floor first and then switching.
+	 */
+	initialMapId?: number;
+	/**
+	 * Without `initialMapId`: show first the floor this resource's pin is on
+	 * (host externalId — the host's `initialFloor: { resource }`). Ignored
+	 * when the resource has no pin.
+	 */
+	initialResourceId?: string | number;
+	/**
+	 * On a container resize keep the zoom and the world point at the centre
+	 * of the view (pan only) instead of re-framing the floor's pins. The
+	 * first layout still frames. Default false.
+	 */
+	keepViewOnResize?: boolean;
 }
 
 /** Public-surface alias (core/index.ts exports `MinimapOptions`). */
@@ -712,6 +789,45 @@ export interface MinimapInstance {
 	/** Subscribe to the native user-location settle (`MOVING_OBJECT_ANIMATION_COMPLETE`)
 	 *  — the veer-check trigger. Returns an unsubscribe fn (no-op if unavailable). */
 	subscribeUserLocationSettled: (cb: () => void) => () => void;
+	/**
+	 * Register a map-tap listener. The tap arrives in the CURRENT floor's
+	 * world frame, synchronously on pointerup. A tap is one pointer, alone on
+	 * the map, that goes down and up within 1 s and never moves more than
+	 * 8 px; a drag (pan), a second pointer on the map (pinch) or
+	 * pointercancel is not a tap. Pointers elsewhere on the page don't count.
+	 * Returns an unregister function. No DOM listener exists until the
+	 * first call, and the last unregister (or destroy) removes it.
+	 */
+	onTap: (cb: (tap: { worldX: number; worldY: number; mapId: number }) => void) => () => void;
+	/**
+	 * Resolve a tap (from `onTap`) to the selectable item it means: nothing
+	 * when the tap is outside the building (the floor's Boundary outline),
+	 * else the innermost accepted resource whose unit polygon contains it,
+	 * else the nearest accepted resource pin or amenity within the cap, else
+	 * null. Pure lookup — never moves the camera or styles anything.
+	 */
+	resolveTap: (
+		tap: { worldX: number; worldY: number; mapId: number },
+		opts: ResolveTapOpts,
+	) => TapResolution | null;
+	/**
+	 * Jibestream details (MapSelection.jibestream) of a placed pin, by floor +
+	 * pin index. Cached: every call for a pin returns the same object, so copy
+	 * it before changing it.
+	 */
+	describePin: (mapId: number, pinIndex: number) => MapSelection['jibestream'];
+	/**
+	 * Fill the unit polygon(s) of the given resources (by externalId, matched
+	 * through their pins) with the free/busy/unavailable colour; units painted
+	 * before and no longer listed get their venue style back. null / [] clears.
+	 * Floors not parsed yet are painted when JMap parses them. `colors` are hex.
+	 */
+	setAvailability: (
+		entries: Array<{ externalId: string | number; state: AvailabilityState }> | null,
+		colors?: { free?: string; busy?: string; unavailable?: string },
+	) => void;
+	/** The listed floors (see CreateMinimapOpts.allFloors) with their JMap metadata. */
+	listFloors: () => FloorSummary[];
 	/** Tear down the JMap controller and detach RAF/event listeners. */
 	destroy: () => void;
 }
@@ -808,7 +924,9 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		unresolved++;
 	}
 
-	if (byMap.size === 0) {
+	// Under allFloors an empty resource set is legitimate (venue browser) —
+	// the floor list comes from the venue's maps below.
+	if (byMap.size === 0 && !opts.allFloors) {
 		throw new Error(unresolved > 0
 			? "Couldn't locate any of these on the map."
 			: 'No floors to render.');
@@ -958,11 +1076,70 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	let lastWayfindSegments: unknown[] = [];
 
 	const mapsColl = getCollection(activeVenue, 'maps') as
-		| { getById?: (id: number) => unknown }
+		| { getById?: (id: number) => unknown; getAll?: () => unknown[] }
 		| null;
 	const destColl = getCollection(activeVenue, 'destinations') as
 		| { getById?: (id: number) => unknown }
 		| null;
+	const buildingsColl = getCollection(activeVenue, 'buildings') as
+		| { getFloorByMap?: (map: unknown) => unknown }
+		| null;
+
+	// Floor labels live on the JMap FLOOR model (name / shortName / level /
+	// elevation) — the Map model only carries geometry (width, height, svg…).
+	// Resolve through buildings.getFloorByMap(map). shortName is whatever the
+	// JACS payload carried — usually a string from the CMS ("L3", "44", "G").
+	// JMap's Floor setter is typed Number, but the model constructor copies
+	// the raw payload into its `_` bag without calling setters, so the getter
+	// returns the string unchanged; accept both types here.
+	type FloorMeta = {
+		name: string | null;
+		shortName: string | number | null;
+		level: number | null;
+		elevation: number | null;
+		/** False when the map belongs to no building floor (e.g. a venue-level map). */
+		isFloor: boolean;
+	};
+	// Memoised: the venue is immutable for the controller's life, and
+	// getFloorByMap is a linear scan that allocates on every call.
+	const floorMetaCache = new Map<number, FloorMeta>();
+	function floorMeta(mapId: number): FloorMeta {
+		const hit = floorMetaCache.get(mapId);
+		if (hit) return hit;
+		const out: FloorMeta = { name: null, shortName: null, level: null, elevation: null, isFloor: false };
+		floorMetaCache.set(mapId, out);
+		const mapObj = mapsColl?.getById?.(mapId);
+		if (!mapObj) return out;
+		try {
+			const fl = buildingsColl?.getFloorByMap?.(mapObj) as
+				| { name?: unknown; shortName?: unknown; level?: unknown; elevation?: unknown }
+				| null
+				| undefined;
+			if (fl) {
+				out.isFloor = true;
+				if (typeof fl.name === 'string' && fl.name) out.name = fl.name;
+				if (typeof fl.shortName === 'number' && Number.isFinite(fl.shortName)) out.shortName = fl.shortName;
+				else if (typeof fl.shortName === 'string' && fl.shortName.trim()) out.shortName = fl.shortName.trim();
+				if (typeof fl.level === 'number') out.level = fl.level;
+				if (typeof fl.elevation === 'number') out.elevation = fl.elevation;
+			}
+		} catch (e) {
+			jibLog('minimap', 'getFloorByMap threw', e);
+		}
+		return out;
+	}
+	// Label from JMap data alone (no host override): Floor.name, then its
+	// shortName; null when the venue has neither.
+	function jmapFloorLabel(mapId: number): string | null {
+		const fm = floorMeta(mapId);
+		return fm.name ?? (fm.shortName != null ? String(fm.shortName) : null);
+	}
+	// …with the raw id as a last resort. Only allFloors mounts label floors
+	// from the Floor model; legacy mounts keep the historical raw-id fallback
+	// (a label change would be a visible change for every existing host).
+	function floorBaseName(mapId: number): string {
+		return (opts.allFloors ? jmapFloorLabel(mapId) : null) ?? `Floor ${mapId}`;
+	}
 
 	for (const g of byMap.values()) {
 		const m = mapsColl?.getById?.(g.mapId) as
@@ -974,7 +1151,13 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		// "Level 1"). Only use the numeric mapId fallback as a last resort
 		// — the raw id is meaningless to users.
 		const resourceFloor = g.items.find(it => !!it.res.floorName)?.res.floorName;
-		g.mapName = m?.name || m?.shortName || m?.floorName || resourceFloor || `Floor ${g.mapId}`;
+		// The Map model carries no name in practice (floor labels are on the
+		// Floor model — see floorMeta); the Map probes are kept for parity with
+		// older payloads. Under allFloors the Floor model comes ahead of the
+		// resource floorName so pin floors and pin-less floors are labelled the
+		// same way; legacy mounts keep the historical chain unchanged.
+		const floorModelName = opts.allFloors ? jmapFloorLabel(g.mapId) : null;
+		g.mapName = m?.name || m?.shortName || m?.floorName || floorModelName || resourceFloor || `Floor ${g.mapId}`;
 		// Host-supplied floor label overrides (e.g. { 7659: 'Floor 1', 8837: 'Floor 2' }).
 		// Takes precedence over all JMap-derived names so venue-specific map IDs
 		// never appear in the UI.
@@ -996,10 +1179,25 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	// must clear all of these, not just the resource floors.
 	const labelledMapIds = new Set<number>();
 
+	// Jibestream identity of each placed pin, aligned 1:1 with its floor's
+	// `pins` array: the destination (from the 'dest' resolution, else the
+	// venue's waypoint index) and the waypoint the resource resolved
+	// through. Tap selection and availability fills match unit polygons to
+	// host resources through these.
+	interface PinRef {
+		pin: PinInfo;
+		extKey: string | null;
+		destId: number | null;
+		wpId: number | null;
+		wp: unknown;
+	}
+	const pinRefsByMap = new Map<number, PinRef[]>();
+
 	// For each floor, look up units per resource so we can compute pin centres.
 	const floors: FloorInfo[] = [];
 	for (const g of byMap.values()) {
 		const pins: PinInfo[] = [];
+		const refs: PinRef[] = [];
 		const mapObj = mapsColl?.getById?.(g.mapId);
 
 		for (const it of g.items) {
@@ -1010,6 +1208,7 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 			const externalIdKey = it.res.externalId != null ? String(it.res.externalId) : null;
 			const wpHit = externalIdKey ? lookupWaypoint(activeVenue, g.mapId, externalIdKey, jibLog) : null;
 			if (wpHit && externalIdKey) waypointByExternalId.set(externalIdKey, wpHit.wp);
+			const placedBefore = pins.length;
 
 			// Place the pin per the resolution kind recorded in the grouping
 			// loop — the priority order lives there, not here.
@@ -1034,9 +1233,21 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 					break;
 				}
 			}
+			if (pins.length > placedBefore) {
+				const wpNum = wpHit ? Number(externalIdKey) : NaN;
+				const wpId = Number.isFinite(wpNum) ? wpNum : null;
+				refs.push({
+					pin: pins[pins.length - 1],
+					extKey: externalIdKey,
+					destId: it.dest?.id ?? (wpId != null ? venue.byWaypointId.get(wpId)?.id ?? null : null),
+					wpId,
+					wp: wpHit?.wp ?? null,
+				});
+			}
 		}
 
 		floors.push({ mapId: g.mapId, mapName: g.mapName, pins });
+		pinRefsByMap.set(g.mapId, refs);
 	}
 
 	// Always include the kiosk's floor in the rendered floor list so the
@@ -1050,13 +1261,54 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 			| { name?: string; shortName?: string; floorName?: string }
 			| null
 			| undefined;
-		const baseName = kMapObj?.name || kMapObj?.shortName || kMapObj?.floorName || `Floor ${kMapId}`;
+		const baseName = kMapObj?.name || kMapObj?.shortName || kMapObj?.floorName || floorBaseName(kMapId);
 		const labeled = cfg.floorLabels?.[kMapId] ?? baseName;
 		floors.push({ mapId: kMapId, mapName: labeled, pins: [] });
 	}
 
-	floors.sort((a, b) => (b.pins.length - a.pins.length) || (a.mapId - b.mapId));
-	const dominantMapId = floors[0]?.mapId ?? null;
+	// Venue-wide floor list (opts.allFloors): every JMap map that belongs to
+	// a building floor, not just the ones carrying pins. `activeVenue.maps`
+	// can also hold a venue-level map (populate.venue creates one when the
+	// venue payload carries a `map`), which is not a floor and must not
+	// become a floor chip. If the buildings collection can't answer (older
+	// jmap builds without getFloorByMap), fall back to listing every map.
+	const canTellFloors = typeof buildingsColl?.getFloorByMap === 'function';
+	if (opts.allFloors) {
+		for (const m of (mapsColl?.getAll?.() ?? []) as Array<{ id?: number }>) {
+			if (typeof m.id !== 'number' || floors.some(f => f.mapId === m.id)) continue;
+			if (canTellFloors && !floorMeta(m.id).isFloor) continue;
+			floors.push({ mapId: m.id, mapName: cfg.floorLabels?.[m.id] ?? floorBaseName(m.id), pins: [] });
+		}
+	}
+	// Building order (floorOrder 'building', always under allFloors) — what a
+	// floor selector wants. Otherwise keep the historical pins-desc order.
+	if (opts.allFloors || opts.floorOrder === 'building') {
+		// Keyed from ONE source every real floor has (mixing keys puts "G"
+		// after "2"): level, else elevation, else a numeric shortName, else
+		// mapId. Pin/kiosk floors on a non-floor map sort last.
+		const isBuilding = (mapId: number) => !canTellFloors || floorMeta(mapId).isFloor;
+		const numericShort = (fm: FloorMeta): number | null => {
+			const n = fm.shortName != null ? Number(fm.shortName) : NaN;
+			return Number.isFinite(n) ? n : null;
+		};
+		const building = floors.filter(f => isBuilding(f.mapId)).map(f => floorMeta(f.mapId));
+		const keyOf = [(fm: FloorMeta) => fm.level, (fm: FloorMeta) => fm.elevation, numericShort]
+			.find(src => building.every(fm => src(fm) != null));
+		const key = (mapId: number) => (keyOf ? keyOf(floorMeta(mapId)) : null) ?? mapId;
+		floors.sort((a, b) =>
+			(Number(isBuilding(b.mapId)) - Number(isBuilding(a.mapId)))
+			|| (key(a.mapId) - key(b.mapId))
+			|| (a.mapId - b.mapId));
+	} else {
+		floors.sort((a, b) => (b.pins.length - a.pins.length) || (a.mapId - b.mapId));
+	}
+	// Dominant = most pins (first in list on ties — floors[0] in pins order);
+	// with no pins at all (allFloors, empty resources) it is the first floor
+	// in building order.
+	const dominantMapId = floors.reduce<FloorInfo | null>(
+		(best, f) => (best == null || f.pins.length > best.pins.length ? f : best),
+		null,
+	)?.mapId ?? null;
 
 	// --- View management -----------------------------------------------------
 
@@ -1069,6 +1321,18 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 	let hasFramedRoute = false;
 	let lastDrawnSig: string | null = null;
 
+	// keepViewOnResize (see resizeKeepingView): the world point the view keeps
+	// at its centre across resizes, and the view signature as the last resize
+	// left it — a different signature means something else (a pan, a zoom, a
+	// focus, a floor switch) has moved the view since, and its centre is the
+	// one to keep from then on. A fit asked for while the container has no
+	// size can't be sized: it waits in `pendingFit` for the container to open.
+	const keepView = opts.keepViewOnResize === true;
+	let keptCenter: [number, number] | null = null;
+	let keptSig = '';
+	let collapsed = false;
+	let pendingFit: { rect: UnitBounds; padding: number; mapId: number } | null = null;
+
 	function setFloor(mapId: number, scheduleFraming = true): Promise<void> {
 		if (mapId === currentMapId) return Promise.resolve();
 		const mapObj = mapsColl?.getById?.(mapId);
@@ -1080,6 +1344,9 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 			jibLog('minimap', 'showMap threw', e);
 			return Promise.resolve();
 		}
+		// Defensive, idempotent re-apply of the availability fills on the floor
+		// just shown (a no-op unless the host set availability).
+		repaintAvailability(mapId);
 		// After switch, frame the floor's pins. Returns a promise so the
 		// caller can hold a loading overlay over the canvas until the new
 		// floor is rendered + zoomed — without it the user sees the new
@@ -1093,24 +1360,40 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		});
 	}
 
-	function centerOnWorld(world: { worldX: number; worldY: number; mapId: number }): void {
-		if (currentMapId == null || world.mapId !== currentMapId) return;
-		const ctl = control as Record<string, unknown>;
-		const stage = ctl.stage as Record<string, unknown> | undefined;
+	// Fit the current map view to a world rect. `then` runs inside the same
+	// try, right after the fit; a throw from either is logged as `failMsg`.
+	// No-op when JMap's fit is unavailable.
+	function fitView(rect: UnitBounds, padding: number, failMsg: string, then?: () => void): void {
+		const stage = (control as Record<string, unknown>).stage as Record<string, unknown> | undefined;
 		const view = stage?.currentMapView as {
 			fitBoundsInView?: (opts: Record<string, unknown>) => unknown;
 		} | undefined;
 		if (typeof view?.fitBoundsInView !== 'function') return;
+		if (keepView) {
+			if (collapsed) {
+				// Claims the view as it is (a floor switch may have just
+				// replaced it), so the reopening resize keeps this fit.
+				if (currentMapId != null) pendingFit = { rect: { ...rect }, padding, mapId: currentMapId };
+				keptSig = getViewSignature();
+				return;
+			}
+			pendingFit = null;
+		}
+		try {
+			view.fitBoundsInView({ bounds: { ...rect }, padding, speed: 0 });
+			then?.();
+		} catch (e) {
+			jibLog('minimap', failMsg, e);
+		}
+	}
+
+	function centerOnWorld(world: { worldX: number; worldY: number; mapId: number }): void {
+		if (currentMapId == null || world.mapId !== currentMapId) return;
 		// 8x8 unit window around the point keeps the resource pin centred without
 		// zooming all the way in past unit geometry. Padding mirrors frameCurrentFloor's
 		// single-point branch so the view scale matches the auto-frame on open.
 		const rect: UnitBounds = { x: world.worldX - 4, y: world.worldY - 4, width: 8, height: 8 };
-		try {
-			view.fitBoundsInView({ bounds: { ...rect }, padding: 64, speed: 0 });
-			opts.onViewChange?.();
-		} catch (e) {
-			jibLog('minimap', 'fitBoundsInView (centerOnWorld) threw', e);
-		}
+		fitView(rect, 64, 'fitBoundsInView (centerOnWorld) threw', () => opts.onViewChange?.());
 	}
 
 	function frameCurrentFloor(): void {
@@ -1119,24 +1402,58 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		const syntheticPin = (lastSyntheticStartPos && lastSyntheticStartPos.mapId === currentMapId)
 			? { worldX: lastSyntheticStartPos.worldX, worldY: lastSyntheticStartPos.worldY }
 			: null;
-		if (floor.pins.length === 0 && !syntheticPin) return;
+		if (floor.pins.length === 0 && !syntheticPin) {
+			// Nothing to frame. Under allFloors (venue browser) fit the whole
+			// floor footprint so the user sees the floorplan rather than JMap's
+			// default extent; legacy mounts keep the default extent (kiosk-only
+			// floors were never framed before).
+			if (opts.allFloors) frameWholeFloor();
+			return;
+		}
 		const allPoints = syntheticPin ? [...floor.pins, syntheticPin] : floor.pins;
 		const rect: UnitBounds | null = allPoints.length === 1
 			? { x: allPoints[0].worldX - 4, y: allPoints[0].worldY - 4, width: 8, height: 8 }
 			: rectFromPoints(allPoints);
 		if (!rect) return;
 		const span = Math.max(rect.width, rect.height);
-		const padding = Math.max(8, span * 1.5);
-		const ctl = control as Record<string, unknown>;
-		const stage = ctl.stage as Record<string, unknown> | undefined;
-		const view = stage?.currentMapView as {
-			fitBoundsInView?: (opts: Record<string, unknown>) => unknown;
-		} | undefined;
-		if (typeof view?.fitBoundsInView === 'function') {
-			try { view.fitBoundsInView({ bounds: { ...rect }, padding, speed: 0 }); }
-			catch (e) { jibLog('minimap', 'fitBoundsInView threw', e); }
-		}
+		fitView(rect, Math.max(8, span * 1.5), 'fitBoundsInView threw');
 		opts.onViewChange?.();
+	}
+
+	// Building footprint per floor (union of the unit centres) — preferred
+	// over the full map extent, which usually includes a lot of outdoor
+	// surroundings that would leave the building small in the viewport.
+	// Cached: the venue never changes, and resizes re-frame often.
+	const footprintCache = new Map<number, UnitBounds | null>();
+	function floorFootprint(mapId: number): UnitBounds | null {
+		if (footprintCache.has(mapId)) return footprintCache.get(mapId) ?? null;
+		const pts: Array<{ worldX: number; worldY: number }> = [];
+		for (const u of unitsOn(mapId)) {
+			const c = unitCenterFromPoints(u);
+			if (c) pts.push({ worldX: c.x, worldY: c.y });
+		}
+		const size = floorSizeWorld(mapId);
+		const rect = pts.length >= 2 ? rectFromPoints(pts)
+			: size ? { x: 0, y: 0, width: size.width, height: size.height }
+				: null;
+		footprintCache.set(mapId, rect);
+		return rect;
+	}
+
+	function frameWholeFloor(): void {
+		if (currentMapId == null) return;
+		const rect = floorFootprint(currentMapId);
+		if (!rect) return;
+		fitView(rect, Math.max(24, Math.max(rect.width, rect.height) * 0.15), 'fitBoundsInView (frameWholeFloor) threw');
+		opts.onViewChange?.();
+	}
+
+	// Unit polygons of a floor (JMap "units" layer), [] when unavailable.
+	function unitsOn(mapId: number): unknown[] {
+		const mapObj = mapsColl?.getById?.(mapId);
+		if (!mapObj || typeof control.getUnitsFromMap !== 'function') return [];
+		try { return control.getUnitsFromMap(mapObj) ?? []; }
+		catch (e) { jibLog('minimap', 'getUnitsFromMap threw', e); return []; }
 	}
 
 	function rectFromPoints(pins: Array<{ worldX: number; worldY: number }>): UnitBounds {
@@ -1218,11 +1535,77 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		catch (e) { jibLog('minimap', 'stage.renderer.resize threw', e); }
 	}
 
+	// Viewport point (CSS px on JMap's canvas) ↔ current floor's world frame.
+	function mapPointAt(v: [number, number]): [number, number] | null {
+		const stage = (control as Record<string, unknown>).stage as {
+			getMapPointFromViewPortPoint?: (p: [number, number]) => [number, number];
+		} | undefined;
+		if (typeof stage?.getMapPointFromViewPortPoint !== 'function') return null;
+		try {
+			const [x, y] = stage.getMapPointFromViewPortPoint(v);
+			return Number.isFinite(x) && Number.isFinite(y) ? [x, y] : null;
+		} catch { return null; }
+	}
+	function putMapPointAt(p: [number, number], v: [number, number]): void {
+		const stage = (control as Record<string, unknown>).stage as {
+			putMapPointOnViewPortPoint?: (p: [number, number], v: [number, number]) => [number, number];
+			currentMapView?: { setPosition?: (pos: [number, number]) => unknown };
+		} | undefined;
+		if (typeof stage?.putMapPointOnViewPortPoint !== 'function' || typeof stage.currentMapView?.setPosition !== 'function') return;
+		try { stage.currentMapView.setPosition(stage.putMapPointOnViewPortPoint(p, v)); }
+		catch (e) { jibLog('minimap', 'keepViewOnResize setPosition threw', e); }
+	}
+
 	let lastWidth = 0, lastHeight = 0;
+
+	// keepViewOnResize: a resize pans the view so the kept world point stays
+	// at the centre, at the same zoom (JMap's MapView.setCenterPosition, with
+	// the new size's centre). The kept point is re-read (at the old size's
+	// centre) only when something else has moved the view since the last
+	// resize (or when none is kept yet and no deferred fit waits), so a
+	// container that collapses to zero and opens again — and reports every
+	// size on the way — lands exactly where it started. A fit deferred while
+	// collapsed (a focus meanwhile) is applied at every size the opening
+	// container reports, so it ends sized for the final one; the next view
+	// change drops it. The first layout frames as without the option.
+	function resizeKeepingView(width: number, height: number): void {
+		if (width === 0 || height === 0) { collapsed = true; return; }
+		const reopened = collapsed;
+		collapsed = false;
+		const sameSize = Math.abs(width - lastWidth) < 1 && Math.abs(height - lastHeight) < 1;
+		if (sameSize && !(reopened && pendingFit)) return;
+		const firstLayout = lastWidth === 0 && lastHeight === 0;
+		if (!firstLayout && currentMapId != null && ((keptCenter == null && !pendingFit) || getViewSignature() !== keptSig)) {
+			pendingFit = null;
+			keptCenter = mapPointAt([lastWidth / 2, lastHeight / 2]);
+		}
+		if (!sameSize) {
+			lastWidth = width; lastHeight = height;
+			resizeJmap(width, height);
+		}
+		if (currentMapId == null) return;
+		if (firstLayout) {
+			frameCurrentFloor();
+		} else if (pendingFit) {
+			const fit = pendingFit;
+			if (fit.mapId === currentMapId) {
+				fitView(fit.rect, fit.padding, 'fitBoundsInView (keepViewOnResize) threw');
+				pendingFit = fit;
+			} else {
+				pendingFit = null;
+			}
+		} else if (keptCenter) {
+			putMapPointAt(keptCenter, [width / 2, height / 2]);
+		}
+		keptSig = getViewSignature();
+		opts.onViewChange?.();
+	}
+
 	const resizeObserver = typeof ResizeObserver !== 'undefined'
 		? new ResizeObserver(entries => {
 			for (const entry of entries) {
 				const { width, height } = entry.contentRect;
+				if (keepView) { resizeKeepingView(width, height); continue; }
 				if (width === 0 || height === 0) continue;
 				if (Math.abs(width - lastWidth) < 1 && Math.abs(height - lastHeight) < 1) continue;
 				lastWidth = width; lastHeight = height;
@@ -1237,6 +1620,11 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		disposed = true;
 		if (rafHandle != null) cancelAnimationFrame(rafHandle);
 		resizeObserver?.disconnect();
+		tapListeners.clear();
+		detachTapInput?.();
+		detachTapInput = null;
+		unsubscribeParsing?.();
+		unsubscribeParsing = null;
 		try { control.destroy?.(); } catch (e) { jibLog('minimap', 'control.destroy threw', e); }
 		try { disposeAuthShim?.(); } catch (e) { jibLog('minimap', 'auth shim dispose threw', e); }
 	}
@@ -1805,19 +2193,22 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		}
 	}
 
-	function subscribeUserLocationSettled(cb: () => void): () => void {
-		type Dispatcher = {
-			subscribe?: (ev: string, fn: (mo: unknown) => void) => unknown;
-			unsubscribe?: (ev: string, fn: (mo: unknown) => void) => void;
-		};
-		// The dispatcher's home varies by bundled build: the jmap namespace, the
-		// controller instance, or the controller's stage. Try each so auto-reroute
-		// doesn't silently no-op when it isn't on `jmap`.
+	type Dispatcher = {
+		subscribe?: (ev: string, fn: (mo: unknown) => void) => unknown;
+		unsubscribe?: (ev: string, fn: (mo: unknown) => void) => void;
+	};
+	// The dispatcher's home varies by bundled build: the jmap namespace, the
+	// controller instance, or the controller's stage. Try each so subscribers
+	// (auto-reroute, availability) don't silently no-op when it isn't on `jmap`.
+	function jmapDispatcher(): Dispatcher | undefined {
 		const ctl = control as { dispatcher?: Dispatcher; stage?: { dispatcher?: Dispatcher } };
-		const dispatcher: Dispatcher | undefined =
-			(jmap as { dispatcher?: Dispatcher }).dispatcher
+		return (jmap as { dispatcher?: Dispatcher }).dispatcher
 			?? ctl.dispatcher
 			?? ctl.stage?.dispatcher;
+	}
+
+	function subscribeUserLocationSettled(cb: () => void): () => void {
+		const dispatcher = jmapDispatcher();
 		if (!dispatcher || typeof dispatcher.subscribe !== 'function') {
 			jibLog('minimap', 'subscribeUserLocationSettled: dispatcher unavailable');
 			return () => {};
@@ -1893,18 +2284,743 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		return out;
 	}
 
+	// --- Map taps + Jibestream item data ----------------------------------------
+	//
+	// Plumbing for tap selection and unit styling: tap detection, a per-floor
+	// unit-polygon index (hit-testing) and building outline, the amenity
+	// waypoint index ("nearest thing"), and JSON-safe exports of the matched
+	// JMap models.
+
+	type TapPoint = { worldX: number; worldY: number; mapId: number };
+	type JModel = {
+		id?: number;
+		name?: string | null;
+		externalId?: string | null;
+		description?: string | null;
+		keywords?: unknown[];
+		tags?: unknown[];
+		locations?: { getAll?: () => Array<{ mapId?: number; waypointIds?: number[] }> } | Array<{ mapId?: number; waypointIds?: number[] }>;
+		_?: Record<string, unknown>;
+		export?: () => unknown;
+	};
+	type JWaypoint = { id?: number; mapId?: number; _?: Record<string, unknown>; export?: () => unknown };
+
+	// Taps are detected here from Pointer Events on the map container, not
+	// through JMap's enableGenericTapHandler: JMap's singletap waits out
+	// Hammer's double-tap window (~300 ms after pointerup), drops presses
+	// longer than 250 ms and swallows both taps of a double-click. A tap is
+	// one pointer (main button), alone on the map, that goes down and up
+	// within TAP_MAX_MS and never strays more than TAP_SLOP_PX from where it
+	// went down; moving further (a pan), a second pointer going down on the
+	// map (a pinch) or pointercancel voids it. Only the map's own pointers
+	// count, as with Hammer's tap: a finger resting elsewhere on the page
+	// (a thumb on the pane below) does not block taps. The listeners only
+	// observe (no preventDefault or stopPropagation), so JMap's drag / pinch
+	// / wheel handling runs exactly as before. Armed on the first onTap,
+	// removed with the last listener or on destroy.
+	const TAP_SLOP_PX = 8;
+	const TAP_MAX_MS = 1000;
+	const tapListeners = new Set<(tap: TapPoint) => void>();
+	let detachTapInput: (() => void) | null = null;
+	function armTapInput(): () => void {
+		const el = opts.container;
+		let press: { id: number; x: number; y: number; t: number } | null = null;
+		// The pointers down on the map (pointerId → pointerType). They are
+		// followed on the window while any is down, so a release off the map
+		// still ends them.
+		const down = new Map<number, string>();
+		const WINDOW_EVENTS = ['pointermove', 'pointerup', 'pointercancel'] as const;
+		let following = false;
+		const follow = (on: boolean) => {
+			if (on === following) return;
+			following = on;
+			for (const type of WINDOW_EVENTS) {
+				if (on) window.addEventListener(type, onWindow, true);
+				else window.removeEventListener(type, onWindow, true);
+			}
+		};
+		const strayed = (e: PointerEvent, p: { x: number; y: number }) =>
+			Math.hypot(e.clientX - p.x, e.clientY - p.y) > TAP_SLOP_PX;
+		function onDown(e: PointerEvent): void {
+			// A primary pointer means no other of its type is down anywhere,
+			// so any such left here lost its pointerup (released off the page).
+			if (e.isPrimary) for (const [id, type] of down) if (type === e.pointerType) down.delete(id);
+			const lone = down.size === 0;
+			down.set(e.pointerId, e.pointerType);
+			follow(true);
+			// Only a pointer alone on the map, with the main button, can tap;
+			// one more going down is a second finger (a pinch) and voids it.
+			press = lone && e.button === 0 ? { id: e.pointerId, x: e.clientX, y: e.clientY, t: e.timeStamp } : null;
+		}
+		function onWindow(e: PointerEvent): void {
+			if (!down.has(e.pointerId)) return;
+			const p = press && press.id === e.pointerId ? press : null;
+			if (e.type === 'pointermove') { if (p && strayed(e, p)) press = null; return; }
+			down.delete(e.pointerId);
+			if (down.size === 0) follow(false);
+			if (!p) return;
+			press = null;
+			if (e.type === 'pointerup') onUp(e, p);
+		}
+		function onUp(e: PointerEvent, p: { x: number; y: number; t: number }): void {
+			if (e.timeStamp - p.t > TAP_MAX_MS || strayed(e, p)) return;
+			const w = viewportToWorld(e.clientX, e.clientY);
+			if (!w || currentMapId == null) return;
+			const tap: TapPoint = { worldX: w.x, worldY: w.y, mapId: currentMapId };
+			for (const l of tapListeners) {
+				try { l(tap); } catch (err) { jibLog('minimap', 'tap listener threw', err); }
+			}
+		}
+		el.addEventListener('pointerdown', onDown);
+		return () => {
+			el.removeEventListener('pointerdown', onDown);
+			press = null;
+			down.clear();
+			follow(false);
+		};
+	}
+	function onTap(cb: (tap: TapPoint) => void): () => void {
+		tapListeners.add(cb);
+		if (!detachTapInput && !disposed) detachTapInput = armTapInput();
+		return () => {
+			tapListeners.delete(cb);
+			if (tapListeners.size === 0) {
+				detachTapInput?.();
+				detachTapInput = null;
+			}
+		};
+	}
+
+	// Client (CSS px) point → the current floor's world frame: the inverse of
+	// projectWorldToViewport (stage.getMapPointFromViewPortPoint =
+	// currentMapView.container.toLocal). The viewport point is taken relative
+	// to JMap's canvas and scaled for a CSS-transformed canvas, exactly as
+	// JMap's own hit-test does (stage.__getXY).
+	function viewportToWorld(clientX: number, clientY: number): { x: number; y: number } | null {
+		const stage = (control as Record<string, unknown>).stage as {
+			view?: unknown;
+			getMapPointFromViewPortPoint?: (p: [number, number]) => [number, number];
+		} | undefined;
+		if (typeof stage?.getMapPointFromViewPortPoint !== 'function') return null;
+		const el = stage.view instanceof HTMLElement ? stage.view : opts.container;
+		const r = el.getBoundingClientRect();
+		if (!r.width || !r.height) return null;
+		const vx = (el.offsetWidth * (clientX - r.left - el.clientLeft)) / r.width;
+		const vy = (el.offsetHeight * (clientY - r.top - el.clientTop)) / r.height;
+		try {
+			const [x, y] = stage.getMapPointFromViewPortPoint([vx, vy]);
+			return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+		} catch (e) {
+			jibLog('minimap', 'getMapPointFromViewPortPoint threw', e);
+			return null;
+		}
+	}
+
+	// JSON-safe deep copy (drops functions / cycles by failing to null). Every
+	// Jibestream value handed to the host is plain data, so it can be
+	// JSON.stringify'd, structured-cloned and mutated by the host without
+	// touching JMap's live objects.
+	function jsonClone(v: unknown): unknown {
+		if (v == null || typeof v !== 'object') return v ?? null;
+		try { return JSON.parse(JSON.stringify(v)); } catch { return null; }
+	}
+
+	// JSON snapshot of a JMap model. jmap's export() is already a JSON
+	// round-trip of the model's payload bag; fall back to cloning the bag.
+	function exportModel(m: unknown): Record<string, unknown> | null {
+		if (!m || typeof m !== 'object') return null;
+		const mm = m as JModel;
+		try {
+			const out = typeof mm.export === 'function' ? mm.export() : null;
+			if (out && typeof out === 'object') return out as Record<string, unknown>;
+		} catch { /* fall through to the raw bag */ }
+		return mm._ && typeof mm._ === 'object' ? (jsonClone(mm._) as Record<string, unknown> | null) : null;
+	}
+
+	// A unit shape's meta is JMap's LIVE object (it back-references the shape's
+	// geojson feature and style, and is circular), so never expose it directly:
+	// copy the ids plus the feature's own properties.
+	function exportUnitMeta(meta: unknown): Record<string, unknown> | null {
+		if (!meta || typeof meta !== 'object') return null;
+		const m = meta as { destinationIds?: unknown; waypointIds?: unknown; sourceData?: { properties?: unknown } };
+		return {
+			destinationIds: Array.isArray(m.destinationIds) ? m.destinationIds.filter(n => typeof n === 'number') : [],
+			waypointIds: Array.isArray(m.waypointIds) ? m.waypointIds.filter(n => typeof n === 'number') : [],
+			properties: jsonClone(m.sourceData?.properties ?? null),
+		};
+	}
+
+	// Destination/amenity `locations` is a JMap collection in v4 (getAll()),
+	// a plain array on older payloads, or only present under the raw `_` bag.
+	function modelLocations(m: JModel): Array<{ mapId?: number; waypointIds?: number[] }> {
+		const loc = m.locations;
+		if (Array.isArray(loc)) return loc;
+		if (loc && typeof loc.getAll === 'function') {
+			try { return loc.getAll() ?? []; } catch { return []; }
+		}
+		const raw = m._?.locations;
+		return Array.isArray(raw) ? (raw as Array<{ mapId?: number; waypointIds?: number[] }>) : [];
+	}
+
+	function waypointOnMap(mapObj: unknown, wpId: number): JWaypoint | null {
+		const m = mapObj as { waypoints?: { getById?: (id: number) => unknown } } | null | undefined;
+		try { return (m?.waypoints?.getById?.(wpId) as JWaypoint | undefined) ?? null; } catch { return null; }
+	}
+
+	// Per-floor unit index, built once per floor on first use (the venue is
+	// immutable): each unit polygon's points flattened into typed arrays plus
+	// its bounding box and area, so a tap rejects most units with four
+	// comparisons and never allocates per vertex.
+	interface UnitEntry {
+		unit: unknown;
+		meta: { destinationIds?: number[]; waypointIds?: number[] } | null;
+		xs: Float64Array;
+		ys: Float64Array;
+		minX: number; minY: number; maxX: number; maxY: number;
+		area: number;
+	}
+	const unitIndexCache = new Map<number, UnitEntry[]>();
+	function unitIndex(mapId: number): UnitEntry[] {
+		const hit = unitIndexCache.get(mapId);
+		if (hit) return hit;
+		const out = polygonEntries(unitsOn(mapId));
+		unitIndexCache.set(mapId, out);
+		return out;
+	}
+	function polygonEntries(shapes: unknown[]): UnitEntry[] {
+		const out: UnitEntry[] = [];
+		for (const u of shapes) {
+			const shape = u as { points?: unknown; meta?: UnitEntry['meta'] };
+			const pts = Array.isArray(shape.points) ? shape.points : [];
+			const xs = new Float64Array(pts.length), ys = new Float64Array(pts.length);
+			let n = 0, minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+			for (const p of pts) {
+				const pt = readPoint(p);
+				if (!pt) continue;
+				xs[n] = pt.x; ys[n] = pt.y; n++;
+				if (pt.x < minX) minX = pt.x; if (pt.x > maxX) maxX = pt.x;
+				if (pt.y < minY) minY = pt.y; if (pt.y > maxY) maxY = pt.y;
+			}
+			if (n < 3) continue;
+			// Shoelace area — the innermost of nested containing units wins.
+			let sum = 0;
+			for (let i = 0, j = n - 1; i < n; j = i++) sum += (xs[j] + xs[i]) * (ys[j] - ys[i]);
+			out.push({ unit: u, meta: shape.meta ?? null, xs: xs.subarray(0, n), ys: ys.subarray(0, n), minX, minY, maxX, maxY, area: Math.abs(sum) / 2 });
+		}
+		return out;
+	}
+
+	// Ray-casting point-in-polygon (map-local frame — the same frame as
+	// the tap point and the pin world coords), bbox-rejected first.
+	function unitContains(e: UnitEntry, x: number, y: number): boolean {
+		if (x < e.minX || x > e.maxX || y < e.minY || y > e.maxY) return false;
+		const { xs, ys } = e;
+		let inside = false;
+		for (let i = 0, j = xs.length - 1; i < xs.length; j = i++) {
+			if ((ys[i] > y) !== (ys[j] > y) && x < ((xs[j] - xs[i]) * (y - ys[i])) / (ys[j] - ys[i]) + xs[i]) inside = !inside;
+		}
+		return inside;
+	}
+
+	// The building outline of a floor: the polygons of its JMap "Boundary"
+	// layer (one per building on a multi-building map). A floor without one
+	// falls back to the bounding box of its unit polygons, and a floor with
+	// neither has nothing to test against (every point counts as inside).
+	const footprintIndexCache = new Map<number, UnitEntry[]>();
+	function insideBuilding(mapId: number, x: number, y: number): boolean {
+		let outline = footprintIndexCache.get(mapId);
+		if (!outline) {
+			const mapObj = mapsColl?.getById?.(mapId);
+			let shapes: unknown[] = [];
+			if (mapObj && typeof control.getShapesInLayer === 'function') {
+				try { shapes = control.getShapesInLayer('Boundary', mapObj) ?? []; }
+				catch (e) { jibLog('minimap', 'getShapesInLayer(Boundary) threw', e); }
+			}
+			outline = polygonEntries(shapes);
+			if (outline.length === 0) {
+				const units = unitIndex(mapId);
+				if (units.length > 0) {
+					let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+					for (const u of units) {
+						if (u.minX < minX) minX = u.minX; if (u.maxX > maxX) maxX = u.maxX;
+						if (u.minY < minY) minY = u.minY; if (u.maxY > maxY) maxY = u.maxY;
+					}
+					outline = polygonEntries([{ points: [[minX, minY], [maxX, minY], [maxX, maxY], [minX, maxY]] }]);
+				}
+			}
+			footprintIndexCache.set(mapId, outline);
+		}
+		return outline.length === 0 || outline.some(e => unitContains(e, x, y));
+	}
+
+	// The destination a unit polygon belongs to: its destinationIds, or for a
+	// waypoint-only unit the destination the venue indexes that waypoint
+	// under. ONE rule for tap resolution and unit styling, so a room that can
+	// be selected can also be styled.
+	function unitDestinationId(meta: UnitEntry['meta']): number | undefined {
+		const wpId = meta?.waypointIds?.[0];
+		return meta?.destinationIds?.[0] ?? (wpId != null ? venue.byWaypointId.get(wpId)?.id : undefined);
+	}
+
+	// Amenity index: every amenity waypoint with its coordinate, bucketed by
+	// floor in ONE pass over the venue on first use. Host resources are
+	// matched through their pins; amenities (restrooms, printers, exits…) are
+	// not in the destination index, so "nearest amenity" needs its own list.
+	interface AmenityCandidate { model: JModel; wp: JWaypoint; x: number; y: number }
+	let amenityIndex: Map<number, AmenityCandidate[]> | null = null;
+	function amenitiesOn(mapId: number): AmenityCandidate[] {
+		if (!amenityIndex) {
+			const index = new Map<number, AmenityCandidate[]>();
+			let items: unknown[] = [];
+			try { items = getCollection(activeVenue, 'amenities')?.getAll?.() ?? []; }
+			catch (e) { jibLog('minimap', 'amenity getAll threw', e); }
+			for (const m of items as JModel[]) {
+				for (const loc of modelLocations(m)) {
+					if (typeof loc.mapId !== 'number') continue;
+					const mapObj = mapsColl?.getById?.(loc.mapId);
+					for (const wpId of loc.waypointIds ?? []) {
+						const wp = waypointOnMap(mapObj, wpId);
+						const c = wp ? readWaypointCoord(wp) : null;
+						if (!wp || !c) continue;
+						let bucket = index.get(loc.mapId);
+						if (!bucket) index.set(loc.mapId, bucket = []);
+						bucket.push({ model: m, wp, x: c.x, y: c.y });
+					}
+				}
+			}
+			amenityIndex = index;
+		}
+		return amenityIndex.get(mapId) ?? [];
+	}
+
+	// Jibestream custom properties of a destination/amenity — the CMS
+	// "extensors" map ({ "Filter Category": "Office 1", … }), read from the raw
+	// payload bag. Always a fresh JSON-safe object ({} when none).
+	function modelProperties(model: JModel | null): Record<string, unknown> {
+		const bag = model?._ as { extensors?: unknown; destinationExtensors?: unknown } | undefined;
+		const ext = bag?.extensors ?? bag?.destinationExtensors;
+		if (!ext || typeof ext !== 'object' || Array.isArray(ext)) return {};
+		return (jsonClone(ext) as Record<string, unknown> | null) ?? {};
+	}
+
+	// Millimetres per map unit for a floor (JMap Map.mmPerPixel), or null.
+	function mmPerUnit(mapId: number): number | null {
+		const m = mapsColl?.getById?.(mapId) as { mmPerPixel?: unknown; _?: { mmPerPixel?: unknown } } | null | undefined;
+		const v = m?.mmPerPixel ?? m?._?.mmPerPixel;
+		return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null;
+	}
+
+	// Host resource pins of a floor indexed by destination / waypoint id,
+	// built once per floor on first use (pins and venue are immutable).
+	interface PinRefIndex { byDest: Map<number, PinRef[]>; byWp: Map<number, PinRef[]> }
+	const pinRefIndexCache = new Map<number, PinRefIndex>();
+	function pinRefIndex(mapId: number): PinRefIndex {
+		const hit = pinRefIndexCache.get(mapId);
+		if (hit) return hit;
+		const out: PinRefIndex = { byDest: new Map(), byWp: new Map() };
+		const add = (m: Map<number, PinRef[]>, id: number, r: PinRef) => {
+			const list = m.get(id);
+			if (list) list.push(r); else m.set(id, [r]);
+		};
+		for (const r of pinRefsByMap.get(mapId) ?? []) {
+			if (r.destId != null) add(out.byDest, r.destId, r);
+			if (r.wpId != null) add(out.byWp, r.wpId, r);
+		}
+		pinRefIndexCache.set(mapId, out);
+		return out;
+	}
+
+	// The host resources a unit polygon belongs to — ONE rule for tap
+	// selection and availability fills: any of the unit's destinationIds (or
+	// the destination its first waypoint is indexed under) equal to a pin's
+	// destination, or its waypointIds containing a pin's waypoint.
+	function refsForUnit(meta: UnitEntry['meta'], index: PinRefIndex): PinRef[] {
+		const out: PinRef[] = [];
+		const add = (list: PinRef[] | undefined) => {
+			for (const r of list ?? []) if (!out.includes(r)) out.push(r);
+		};
+		for (const id of meta?.destinationIds ?? []) add(index.byDest.get(id));
+		const own = unitDestinationId(meta);
+		if (own != null) add(index.byDest.get(own));
+		for (const id of meta?.waypointIds ?? []) add(index.byWp.get(id));
+		return out;
+	}
+
+	function modelKeywords(model: JModel | null): string[] {
+		return Array.isArray(model?.keywords) ? model.keywords.map(String) : [];
+	}
+
+	// CMS category of a destination/amenity: the payload's own `category`, else
+	// the category extensor the parent app reads ('Amenity Category'), else a
+	// generic one. Null when the venue carries none.
+	function modelCategory(model: JModel | null, properties: Record<string, unknown>): string | null {
+		const own = model?._?.category;
+		if (typeof own === 'string' && own) return own;
+		for (const k of ['Amenity Category', 'Category', 'Filter Category']) {
+			const v = properties[k];
+			if (typeof v === 'string' && v) return v;
+		}
+		return null;
+	}
+
+	// MapSelection.jibestream for one Jibestream model (+ waypoint / unit).
+	function itemDetails(
+		kind: 'destination' | 'amenity',
+		model: JModel | null,
+		wp: unknown,
+		wpId: number | null,
+		unitMeta?: unknown,
+	): NonNullable<MapSelection['jibestream']> {
+		const properties = modelProperties(model);
+		const raw: NonNullable<MapSelection['jibestream']>['raw'] = {};
+		if (model) raw[kind] = exportModel(model);
+		if (wp) raw.waypoint = exportModel(wp);
+		if (unitMeta) raw.unit = exportUnitMeta(unitMeta);
+		const id = typeof model?.id === 'number' ? model.id : null;
+		return {
+			destinationId: kind === 'destination' ? id : null,
+			amenityId: kind === 'amenity' ? id : null,
+			waypointId: wpId,
+			name: model?.name ?? null,
+			description: model?.description ?? null,
+			externalId: model?.externalId != null && model.externalId !== '' ? String(model.externalId) : null,
+			category: modelCategory(model, properties),
+			keywords: modelKeywords(model),
+			properties,
+			raw,
+		};
+	}
+
+	function refDetails(ref: PinRef, unitMeta?: unknown): MapSelection['jibestream'] {
+		const model = ref.destId != null ? ((destColl?.getById?.(ref.destId) as JModel | undefined) ?? null) : null;
+		if (!model && !ref.wp) return null;
+		const d = itemDetails('destination', model, ref.wp, ref.wpId, unitMeta);
+		// A pin resolved by waypoint only (no destination model) still names its destination id.
+		if (d.destinationId == null) d.destinationId = ref.destId;
+		return d;
+	}
+
+	// Jibestream details of a placed pin (host / card selections). Runs on
+	// every selection, opt-in or not, so it must never throw into the view.
+	// Cached per pin (pins and venue are immutable): a repeat selection costs
+	// nothing. The view deep-copies it on the way out to the host.
+	const pinDetailsCache = new Map<PinRef, MapSelection['jibestream']>();
+	function describePin(mapId: number, pinIndex: number): MapSelection['jibestream'] {
+		const ref = pinRefsByMap.get(mapId)?.[pinIndex];
+		if (!ref) return null;
+		if (pinDetailsCache.has(ref)) return pinDetailsCache.get(ref) ?? null;
+		let details: MapSelection['jibestream'];
+		try { details = refDetails(ref); }
+		catch (e) { jibLog('minimap', 'describePin threw', e); return null; }
+		pinDetailsCache.set(ref, details);
+		return details;
+	}
+
+	// Tap → selectable item on the tapped floor. Never moves the camera.
+	//   0. a tap outside the building (insideBuilding) selects nothing — no
+	//      snapping to a room from the car park or the street;
+	//   a. the innermost (smallest-area) unit polygon containing the tap that
+	//      belongs to an accepted host resource on this floor;
+	//   b. else the nearest accepted resource pin or (when enabled) amenity,
+	//      within maxSnapMeters (no cap when the floor has no scale);
+	//   c. else null (the caller leaves its selection alone).
+	function resolveTap(tap: TapPoint, ropts: ResolveTapOpts): TapResolution | null {
+		const { worldX: tx, worldY: ty, mapId } = tap;
+		if (!insideBuilding(mapId, tx, ty)) return null;
+		const refs = pinRefsByMap.get(mapId) ?? [];
+		const pinIndexOf = (r: PinRef) => refs.indexOf(r);
+		// A throwing host filter rejects that resource rather than breaking the tap.
+		const accepts = (r: PinRef): boolean => {
+			try { return !!ropts.acceptPin(r.pin); }
+			catch (e) { jibLog('minimap', 'tapSelect filter threw', e); return false; }
+		};
+		const mmpp = mmPerUnit(mapId);
+
+		const index = pinRefIndex(mapId);
+		if (index.byDest.size > 0 || index.byWp.size > 0) {
+			let hit: { ref: PinRef; entry: UnitEntry } | null = null;
+			for (const e of unitIndex(mapId)) {
+				if ((hit && e.area >= hit.entry.area) || !unitContains(e, tx, ty)) continue;
+				const ref = refsForUnit(e.meta, index).find(accepts);
+				if (ref) hit = { ref, entry: e };
+			}
+			if (hit) {
+				return {
+					kind: 'resource',
+					mapId,
+					pinIndex: pinIndexOf(hit.ref),
+					name: null,
+					worldX: hit.ref.pin.worldX,
+					worldY: hit.ref.pin.worldY,
+					inside: true,
+					distanceMeters: 0,
+					jibestream: refDetails(hit.ref, hit.entry.meta),
+				};
+			}
+		}
+
+		const maxD = ropts.maxSnapMeters != null && mmpp != null ? (ropts.maxSnapMeters * 1000) / mmpp : Infinity;
+		const maxD2 = maxD * maxD;
+		let bestRef: PinRef | null = null;
+		let bestAmenity: AmenityCandidate | null = null;
+		let bestD2 = Infinity;
+		for (const r of refs) {
+			const d2 = (r.pin.worldX - tx) ** 2 + (r.pin.worldY - ty) ** 2;
+			if (d2 > maxD2 || d2 >= bestD2 || !accepts(r)) continue;
+			bestRef = r;
+			bestD2 = d2;
+		}
+		// Amenities only win when strictly closer (a tie keeps the resource).
+		if (ropts.amenities) {
+			for (const a of amenitiesOn(mapId)) {
+				const d2 = (a.x - tx) ** 2 + (a.y - ty) ** 2;
+				if (d2 > maxD2 || d2 >= bestD2) continue;
+				bestAmenity = a;
+				bestRef = null;
+				bestD2 = d2;
+			}
+		}
+		const distanceMeters = mmpp != null && bestD2 < Infinity ? (Math.sqrt(bestD2) * mmpp) / 1000 : null;
+		if (bestRef) {
+			return {
+				kind: 'resource',
+				mapId,
+				pinIndex: pinIndexOf(bestRef),
+				name: null,
+				worldX: bestRef.pin.worldX,
+				worldY: bestRef.pin.worldY,
+				inside: false,
+				distanceMeters,
+				jibestream: refDetails(bestRef),
+			};
+		}
+		if (bestAmenity) {
+			const wpId = typeof bestAmenity.wp.id === 'number' ? bestAmenity.wp.id : null;
+			const details = itemDetails('amenity', bestAmenity.model, bestAmenity.wp, wpId);
+			return {
+				kind: 'amenity',
+				mapId,
+				pinIndex: -1,
+				name: details.name,
+				worldX: bestAmenity.x,
+				worldY: bestAmenity.y,
+				inside: false,
+				distanceMeters,
+				jibestream: details,
+			};
+		}
+		return null;
+	}
+
+	// --- Availability fills ----------------------------------------------------
+	//
+	// Free/busy/unavailable colour on the unit polygons of host resources,
+	// styled exactly like the parent app (fill colour, grey hairline, 50%
+	// opacity; one styleShapes call per colour; unavailable is the parent's
+	// greyed-space '#c2c2c2'). JMap keeps a style on the Shape model, so
+	// a fill survives floor switches; floors not parsed yet are painted once
+	// JMap has parsed them (JMAP_ENGINE_PARSING_SUCCESS) instead of
+	// force-parsing every floor's SVG up front. Everything is lazy: with no
+	// availability set, no JMap call is made.
+	const AVAILABILITY_STROKE = '#b3b1b1';
+	let availabilityByExt = new Map<string, AvailabilityState>();
+	const AVAILABILITY_DEFAULTS: Record<AvailabilityState, string> = { free: '#00D302', busy: '#DF2E07', unavailable: '#c2c2c2' };
+	let availabilityFill = { ...AVAILABILITY_DEFAULTS };
+	// Shapes this engine has styled, per floor → the state they were painted with.
+	const styledAvailability = new Map<number, Map<unknown, AvailabilityState>>();
+	// Floors that need a fill but weren't parsed yet when last asked.
+	const deferredAvailability = new Set<number>();
+	let deferredPassQueued = false;
+	let unsubscribeParsing: (() => void) | null = null;
+
+	function hexColor(v: unknown, fallback: string): string {
+		if (v == null) return fallback;
+		const m = typeof v === 'string' ? /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(v.trim()) : null;
+		if (!m) {
+			jibLog('minimap', `availability colour ${String(v)} is not hex — using ${fallback}`);
+			return fallback;
+		}
+		const h = m[1].length === 3 ? m[1].split('').map(c => c + c).join('') : m[1];
+		return `#${h}`;
+	}
+
+	function isParsed(mapId: number): boolean {
+		const stage = (control as Record<string, unknown>).stage as { getMapViewById?: (id: number) => unknown } | undefined;
+		// Can't tell → treat as parsed (paint now) rather than never.
+		if (typeof stage?.getMapViewById !== 'function') return true;
+		try { return !!stage.getMapViewById(mapId); } catch { return true; }
+	}
+
+	// ONE frame (currentMapView.render) — never renderCurrentMapView, which
+	// rebuilds every shape and label on the floor.
+	function renderFrame(): void {
+		const stage = (control as Record<string, unknown>).stage as { currentMapView?: { render?: () => void } } | undefined;
+		try { stage?.currentMapView?.render?.(); }
+		catch (e) { jibLog('minimap', 'currentMapView.render threw', e); }
+	}
+
+	// Floors carrying a pin whose resource has an availability entry.
+	function availabilityFloors(): Set<number> {
+		const out = new Set<number>();
+		if (availabilityByExt.size === 0) return out;
+		for (const [mapId, refs] of pinRefsByMap) {
+			if (refs.some(r => r.extKey != null && availabilityByExt.has(r.extKey))) out.add(mapId);
+		}
+		return out;
+	}
+
+	// Paint one (parsed) floor to the current availability. Styles the floor's
+	// CURRENT shape objects (fresh unitsOn, not the cached hit-test index) and
+	// restores shapes that were painted before but no longer carry a state.
+	// Returns true when any shape changed. Idempotent.
+	function paintAvailabilityFloor(mapId: number): boolean {
+		deferredAvailability.delete(mapId);
+		const prev = styledAvailability.get(mapId) ?? new Map<unknown, AvailabilityState>();
+		const next = new Map<unknown, AvailabilityState>();
+		const refs = pinRefsByMap.get(mapId) ?? [];
+		if (availabilityByExt.size > 0 && refs.some(r => r.extKey != null && availabilityByExt.has(r.extKey))) {
+			const index = pinRefIndex(mapId);
+			for (const u of unitsOn(mapId)) {
+				const meta = (u as { meta?: UnitEntry['meta'] }).meta ?? null;
+				const ref = refsForUnit(meta, index).find(r => r.extKey != null && availabilityByExt.has(r.extKey));
+				if (ref) next.set(u, availabilityByExt.get(ref.extKey!)!);
+			}
+		}
+		let changed = false;
+		for (const s of prev.keys()) {
+			if (next.has(s)) continue;
+			try { (s as { resetStyle?: () => void }).resetStyle?.(); changed = true; }
+			catch (e) { jibLog('minimap', 'resetStyle threw', e); }
+		}
+		if (next.size > 0 && typeof control.styleShapes === 'function' && typeof jmap.Style === 'function') {
+			for (const state of ['free', 'busy', 'unavailable'] as const) {
+				const group = [...next].filter(([, st]) => st === state).map(([s]) => s);
+				if (group.length === 0) continue;
+				try {
+					control.styleShapes(group, new jmap.Style({
+						fill: availabilityFill[state],
+						stroke: AVAILABILITY_STROKE,
+						strokeWidth: 1,
+						opacity: 0.5,
+					}));
+					changed = true;
+				} catch (e) {
+					jibLog('minimap', 'availability styleShapes threw', e);
+				}
+			}
+		}
+		if (next.size > 0) styledAvailability.set(mapId, next);
+		else styledAvailability.delete(mapId);
+		return changed;
+	}
+
+	// Paint the deferred floors JMap has parsed since. Runs as a microtask
+	// after a parse event — the parse call has returned (its map view is
+	// registered) but the next frame hasn't rendered — once per burst (JMap
+	// can parse many floors back to back). Doesn't rely on the event payload.
+	function paintDeferredAvailability(): void {
+		deferredPassQueued = false;
+		if (disposed) return;
+		let redrawCurrent = false;
+		for (const mapId of [...deferredAvailability]) {
+			if (isParsed(mapId) && paintAvailabilityFloor(mapId) && mapId === currentMapId) redrawCurrent = true;
+		}
+		if (redrawCurrent) renderFrame();
+	}
+
+	// Subscribed once, on first need; false when no dispatcher is reachable
+	// (the caller then paints eagerly). Unsubscribed in destroy().
+	function ensureParsingHook(): boolean {
+		if (unsubscribeParsing) return true;
+		const dispatcher = jmapDispatcher();
+		if (!dispatcher || typeof dispatcher.subscribe !== 'function') return false;
+		const handler = () => {
+			if (disposed || deferredAvailability.size === 0 || deferredPassQueued) return;
+			deferredPassQueued = true;
+			queueMicrotask(paintDeferredAvailability);
+		};
+		try {
+			dispatcher.subscribe('JMAP_ENGINE_PARSING_SUCCESS', handler);
+		} catch (e) {
+			jibLog('minimap', 'parsing-success subscribe threw', e);
+			return false;
+		}
+		unsubscribeParsing = () => {
+			try { dispatcher.unsubscribe?.('JMAP_ENGINE_PARSING_SUCCESS', handler); }
+			catch (e) { jibLog('minimap', 'parsing-success unsubscribe threw', e); }
+		};
+		return true;
+	}
+
+	function repaintAvailability(mapId: number): void {
+		if (availabilityByExt.size === 0 && !styledAvailability.has(mapId)) return;
+		paintAvailabilityFloor(mapId);
+	}
+
+	function setAvailability(
+		entries: Array<{ externalId: string | number; state: AvailabilityState }> | null,
+		colors?: { free?: string; busy?: string; unavailable?: string },
+	): void {
+		if (disposed) return;
+		const nextByExt = new Map<string, AvailabilityState>();
+		for (const e of entries ?? []) {
+			if (e?.externalId != null && (e.state === 'free' || e.state === 'busy' || e.state === 'unavailable')) nextByExt.set(String(e.externalId), e.state);
+		}
+		// Nothing set now or before → nothing to do (no JMap calls at all).
+		if (nextByExt.size === 0 && availabilityByExt.size === 0 && styledAvailability.size === 0) return;
+		availabilityByExt = nextByExt;
+		availabilityFill = {
+			free: hexColor(colors?.free, AVAILABILITY_DEFAULTS.free),
+			busy: hexColor(colors?.busy, AVAILABILITY_DEFAULTS.busy),
+			unavailable: hexColor(colors?.unavailable, AVAILABILITY_DEFAULTS.unavailable),
+		};
+		const targets = new Set<number>([...styledAvailability.keys(), ...availabilityFloors()]);
+		deferredAvailability.clear();
+		let redrawCurrent = false;
+		for (const mapId of targets) {
+			if (!isParsed(mapId)) { deferredAvailability.add(mapId); continue; }
+			if (paintAvailabilityFloor(mapId) && mapId === currentMapId) redrawCurrent = true;
+		}
+		// No dispatcher → paint the deferred floors now (parses their SVG).
+		if (deferredAvailability.size > 0 && !ensureParsingHook()) {
+			for (const mapId of [...deferredAvailability]) {
+				if (paintAvailabilityFloor(mapId) && mapId === currentMapId) redrawCurrent = true;
+			}
+		}
+		if (redrawCurrent) renderFrame();
+	}
+
+	function listFloors(): FloorSummary[] {
+		return floors.map(f => {
+			const fm = floorMeta(f.mapId);
+			return {
+				mapId: f.mapId,
+				name: f.mapName,
+				shortName: fm.shortName,
+				level: fm.level,
+				hasPins: f.pins.length > 0,
+			};
+		});
+	}
+
 	// Continue guarding the armed auth-shim timer through to the successful
 	// return: any throw during initial floor framing / settle must still
 	// dispose the shim before propagating.
 	try {
-		// Show the dominant floor + start the projection RAF.
-		if (dominantMapId != null) setFloor(dominantMapId, false);
+		// Show the opening floor (host's initialMapId — or initialResourceId's
+		// floor — when listed, else the dominant one) + start the projection RAF.
+		const initialMapId = opts.initialMapId
+			?? (opts.initialResourceId != null ? floorOfResource(floors, opts.initialResourceId) : null);
+		const firstMapId = initialMapId != null && floors.some(f => f.mapId === initialMapId)
+			? initialMapId
+			: dominantMapId;
+		if (firstMapId != null) setFloor(firstMapId, false);
 		rafHandle = requestAnimationFrame(tick);
 
 		// Wait for the renderer to settle, then frame to the pins before we
 		// return. Caller's loading → ready transition then reveals the already-
 		// zoomed view instead of the default extent + a delayed pan/zoom.
-		if (dominantMapId != null) {
+		if (firstMapId != null) {
 			await new Promise<void>(resolve => setTimeout(resolve, MAP_SETTLE_MS));
 			frameCurrentFloor();
 		}
@@ -1937,6 +3053,11 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		centerOnWorld,
 		hasUserVeeredOffRoute,
 		subscribeUserLocationSettled,
+		onTap,
+		resolveTap,
+		describePin,
+		setAvailability,
+		listFloors,
 		destroy,
 	};
 }
