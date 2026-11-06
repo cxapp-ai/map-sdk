@@ -16,6 +16,6 @@
       "@cxapp-ai/map-sdk/core": ["./src/core/index.ts"]
     }
   },
-  "include": ["src/**/*.ts", "src/**/*.svelte", "demo/**/*.ts"],
+  "include": ["src/**/*.ts", "src/**/*.svelte", "demo/**/*.ts", "test/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

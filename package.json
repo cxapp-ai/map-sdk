@@ -24,7 +24,8 @@
     "build": "vite build && vite build --config vite.config.iife.ts",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "dev": "vite --config demo/vite.config.ts",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "test": "vitest run"
   },
   "keywords": [
     "indoor-map",
@@ -36,16 +37,18 @@
   "license": "UNLICENSED",
   "private": true,
   "dependencies": {
-    "jmap.js": "4.14.1"
+    "jmap.js": "4.18.0"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.0.0",
     "@tsconfig/svelte": "^5.0.8",
     "@types/node": "^26.1.1",
+    "fake-indexeddb": "^6.2.6",
     "svelte": "^5.0.0",
     "svelte-check": "^4.4.6",
     "typescript": "^6.0.2",
     "vite": "^8.0.0",
-    "vite-plugin-dts": "^4.5.0"
+    "vite-plugin-dts": "^4.5.0",
+    "vitest": "^5.0.5"
   }
 }

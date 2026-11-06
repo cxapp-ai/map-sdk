@@ -74,6 +74,13 @@ export interface JibestreamConfig {
 	 */
 	mapProfileId?: number;
 	auth: JibestreamAuth;
+	/**
+	 * Keep the venue and building map data in IndexedDB and revalidate it with
+	 * JACS (`If-Modified-Since` → 304), so a repeat open skips the download
+	 * (54 MB at Mutual of Omaha HQ). Default true; false never stores map data
+	 * on the device.
+	 */
+	persistentCache?: boolean;
 
 	// Presentation extras (all optional):
 	/** mapId → human floor label, overrides venue data. */

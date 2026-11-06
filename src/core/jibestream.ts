@@ -242,6 +242,279 @@ export function clearJibestreamCaches(): void {
 		entry.venuePromise = null;
 	}
 	caches.clear();
+	// Same discipline for the stored map data: a fetch still in flight, or a
+	// write already queued for idle time, must not refill the store after the
+	// clear (see saveJacs and clearJacsStore).
+	jacsInflight.clear();
+	clearJacsStore();
+}
+
+// --- Persistent JACS response cache -------------------------------------------
+//
+// The building `/full` response carries every floor's SVG (Mutual of Omaha HQ:
+// 54 MB, 32 floors) and JACS serves it uncompressed with no Cache-Control or
+// ETag, so every open downloaded it again. JMap's own cache can't help: it is
+// localStorage (~5 MB), the write throws, and its catch wipes every cached
+// entry. JACS does answer `If-Modified-Since: <generatedAt>` with 304 (verified
+// on venue and building, 2026-10-15), so responses are kept in IndexedDB and
+// revalidated: an unchanged venue costs a 304 instead of the download.
+//
+// Keyed by the full request URL (host, customer, venue, building, map
+// profile) — never the token. Two stores written in one transaction: `meta`
+// (the tiny `generatedAt` validator, so the conditional request goes out
+// without first reading the body) and `body` (the text, parsed per caller).
+// Storage is best-effort: no IndexedDB (sandboxed iframe, private mode, quota)
+// just means plain network loads, and a failed open is tried again after a
+// short cool-down. `persistentCache: false` turns it off.
+
+const JACS_DB = 'cxai-map-sdk';
+const META = 'meta';
+const BODY = 'body';
+// The query JMap v4 sends (`?v=4.12`) — the response shape it expects.
+const JACS_VERSION_QUERY = 'v=4.12';
+
+interface JacsMeta { generatedAt: number | string }
+
+// The open connection, or the open in progress. A failed or blocked open is
+// not kept: for JACS_DB_RETRY_MS every call gets null without trying (a page
+// with no usable IndexedDB doesn't reopen per call), then the next call opens
+// again (a transient UnknownError, a frame later granted storage).
+let jacsDbPromise: Promise<IDBDatabase | null> | null = null;
+let jacsDbRetryAt = 0;
+const JACS_DB_RETRY_MS = 10_000;
+
+function openJacsDb(): Promise<IDBDatabase | null> {
+	if (jacsDbPromise) return jacsDbPromise;
+	if (Date.now() < jacsDbRetryAt) return Promise.resolve(null);
+	const forget = () => { if (jacsDbPromise === opened) jacsDbPromise = null; };
+	const opened: Promise<IDBDatabase | null> = new Promise<IDBDatabase | null>((resolve) => {
+		try {
+			if (typeof indexedDB === 'undefined') return resolve(null);
+			const req = indexedDB.open(JACS_DB, 1);
+			let settled = false;
+			req.onupgradeneeded = () => {
+				req.result.createObjectStore(META);
+				req.result.createObjectStore(BODY);
+			};
+			req.onsuccess = () => {
+				const db = req.result;
+				if (settled) return db.close(); // a blocked open that got through later
+				settled = true;
+				// Another tab upgrading or deleting the database, or the browser
+				// dropping the connection: let go of it so the next call reopens.
+				db.onversionchange = () => { db.close(); forget(); };
+				db.onclose = forget;
+				flushJacsClear(db); // ahead of every caller's transaction
+				resolve(db);
+			};
+			req.onerror = () => { settled = true; resolve(null); };
+			req.onblocked = () => { settled = true; resolve(null); };
+		} catch {
+			resolve(null);
+		}
+	}).then((db) => {
+		if (!db) {
+			forget();
+			jacsDbRetryAt = Date.now() + JACS_DB_RETRY_MS;
+		}
+		return db;
+	});
+	jacsDbPromise = opened;
+	return opened;
+}
+
+// Runs `run` in one transaction over `stores`; resolves with its request's
+// result once the transaction completes, or null on any failure.
+function jacsTx<T>(
+	stores: string[],
+	mode: IDBTransactionMode,
+	run: (tx: IDBTransaction) => IDBRequest<T> | void,
+): Promise<T | null> {
+	return openJacsDb().then((db) => new Promise<T | null>((resolve) => {
+		if (!db) return resolve(null);
+		try {
+			const tx = db.transaction(stores, mode);
+			const req = run(tx);
+			tx.oncomplete = () => resolve(req ? (req.result as T) ?? null : null);
+			tx.onerror = () => resolve(null);
+			tx.onabort = () => resolve(null);
+		} catch {
+			resolve(null);
+		}
+	}));
+}
+
+const readMeta = (url: string) => jacsTx<JacsMeta>([META], 'readonly', (tx) => tx.objectStore(META).get(url));
+const readBody = (url: string) => jacsTx<string>([BODY], 'readonly', (tx) => tx.objectStore(BODY).get(url));
+
+// Bumped by clearJacsStore. A fetch captures it when it starts, and its write
+// is dropped if a clear happened since.
+let jacsGeneration = 0;
+
+// Set by a clear until its transaction exists. A clear that finds no database
+// (open failed or cooling down, connection closing) stays pending and runs as
+// the first transaction of the next successful open, so a copy the page could
+// not reach at clear time is still gone before anything reads it.
+let jacsClearPending = false;
+
+// Readwrite transactions over the same stores run in the order they are
+// created. The generation moves on synchronously here, and saveJacs reads it
+// in the same turn it creates its transaction, so a write either comes before
+// the clear's transaction (and is wiped by it) or sees the new generation and
+// writes nothing.
+function clearJacsStore(): void {
+	jacsGeneration++;
+	jacsClearPending = true;
+	void openJacsDb().then((db) => { if (db) flushJacsClear(db); });
+}
+
+function flushJacsClear(db: IDBDatabase): void {
+	if (!jacsClearPending) return;
+	try {
+		const tx = db.transaction([META, BODY], 'readwrite');
+		tx.objectStore(META).clear();
+		tx.objectStore(BODY).clear();
+		jacsClearPending = false;
+	} catch {
+		// Connection closing: stays pending for the next open.
+	}
+}
+
+// Writes the copy once the browser is idle — structured-cloning a 54 MB string
+// competes with the first render otherwise. Body and validator go in one
+// transaction, so a validator never points at a missing or older body.
+function saveJacs(url: string, text: string, generation: number): void {
+	const generatedAt = generatedAtOf(text);
+	if (generatedAt == null) return; // nothing to revalidate with
+	const write = () => {
+		void jacsTx([META, BODY], 'readwrite', (tx) => {
+			// Checked as the transaction is created, not before the database
+			// open resolves (see clearJacsStore).
+			if (generation !== jacsGeneration) return; // cleared since the fetch began
+			tx.objectStore(BODY).put(text, url);
+			tx.objectStore(META).put({ generatedAt } satisfies JacsMeta, url);
+		});
+	};
+	const idle = (globalThis as { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => void }).requestIdleCallback;
+	if (idle) idle(write, { timeout: 5000 });
+	else setTimeout(write, 1000);
+}
+
+// The top-level `generatedAt` is among the last keys of a `/full` body (only
+// small scalars follow it), so the last match in the tail is the top-level
+// one — no need to keep a parsed copy around for it.
+function generatedAtOf(text: string): number | string | null {
+	const re = /"generatedAt"\s*:\s*(?:(-?\d+(?:\.\d+)?)|"([^"]*)")/g;
+	const tail = text.slice(-4096);
+	let last: RegExpExecArray | null = null;
+	for (let m = re.exec(tail); m; m = re.exec(tail)) last = m;
+	if (!last) return null;
+	return last[1] != null ? Number(last[1]) : last[2];
+}
+
+export function jacsVenueUrl(cfg: JibestreamConfig): string {
+	return jacsUrl(cfg, `venue/${cfg.venueId}/full`);
+}
+
+export function jacsBuildingUrl(cfg: JibestreamConfig, buildingId: number): string {
+	return jacsUrl(cfg, `venue/${cfg.venueId}/building/${buildingId}/full`);
+}
+
+function jacsUrl(cfg: JibestreamConfig, path: string): string {
+	const url = new URL(`${cfg.host}/JACS/api/customer/${cfg.customerId}/${path}?${JACS_VERSION_QUERY}`);
+	if (cfg.mapProfileId != null) url.searchParams.set('mapProfileId', String(cfg.mapProfileId));
+	return url.toString();
+}
+
+// One network request per URL at a time: the venue is read by both
+// loadVenue (destination index) and the engine (handed to JMap).
+const jacsInflight = new Map<string, Promise<string>>();
+
+/**
+ * GETs a JACS `/full` response as text: from the IndexedDB copy when JACS
+ * answers 304 to `If-Modified-Since: <generatedAt>`, else from the network
+ * (and stored for next time). A network or server failure falls back to the
+ * stored copy when there is one.
+ */
+export function fetchJacsText(cfg: JibestreamConfig, url: string, logger?: MapLogger): Promise<string> {
+	const hit = jacsInflight.get(url);
+	if (hit) return hit;
+	const jibLog = makeJibLog(logger);
+	const useStore = cfg.persistentCache !== false;
+	const generation = jacsGeneration;
+	const p = (async () => {
+		const [meta, token] = await Promise.all([
+			useStore ? readMeta(url) : Promise.resolve(null),
+			getToken(cfg, logger),
+		]);
+		// Read the stored body while the request is in flight.
+		const stored = meta ? readBody(url) : Promise.resolve(null);
+		const get = (conditional: boolean) => fetch(url, {
+			headers: conditional
+				? { Authorization: `Bearer ${token}`, 'If-Modified-Since': String(meta!.generatedAt) }
+				: { Authorization: `Bearer ${token}` },
+		});
+		let res: Response;
+		try {
+			res = await get(!!meta);
+		} catch (err) {
+			const text = await stored;
+			if (text != null) { jibLog('cache', `network failed, using stored copy of ${url}`, err); return text; }
+			throw err;
+		}
+		if (res.status === 304) {
+			const text = await stored;
+			if (text != null) { jibLog('cache', `not modified: ${url}`); return text; }
+			res = await get(false); // validator without a body (evicted) — fetch it whole
+		}
+		if (!res.ok) {
+			const text = res.status >= 500 ? await stored : null;
+			if (text != null) { jibLog('cache', `JACS ${res.status}, using stored copy of ${url}`); return text; }
+			throw new Error(`Jibestream fetch failed: ${res.status} ${url.replace(/\?.*$/, '')}`);
+		}
+		const text = await res.text();
+		if (useStore) saveJacs(url, text, generation);
+		return text;
+	})();
+	jacsInflight.set(url, p);
+	const clear = () => { if (jacsInflight.get(url) === p) jacsInflight.delete(url); };
+	p.then(clear, clear);
+	return p;
+}
+
+/** The venue's raw `/full` JSON (`?v=4.12` — the shape JMap consumes). */
+export async function fetchVenueJson(cfg: JibestreamConfig, logger?: MapLogger): Promise<Record<string, unknown>> {
+	return JSON.parse(await fetchJacsText(cfg, jacsVenueUrl(cfg), logger));
+}
+
+/** A building's raw `/full` JSON — every floor's map, SVG included. */
+export async function fetchBuildingJson(cfg: JibestreamConfig, buildingId: number, logger?: MapLogger): Promise<Record<string, unknown>> {
+	return JSON.parse(await fetchJacsText(cfg, jacsBuildingUrl(cfg, buildingId), logger));
+}
+
+/**
+ * The building the stored venue copy names as default, or null with no copy.
+ * Lets a repeat open revalidate the building alongside the venue instead of
+ * after it (JACS takes ~1.2 s to answer the building's 304). The engine
+ * checks it against the venue JMap actually populates.
+ */
+export async function storedDefaultBuildingId(cfg: JibestreamConfig): Promise<number | null> {
+	if (cfg.persistentCache === false) return null;
+	const text = await readBody(jacsVenueUrl(cfg));
+	if (text == null) return null;
+	try { return defaultBuildingIdOf(JSON.parse(text)); } catch { return null; }
+}
+
+/**
+ * The building JMap will populate by default, read from the raw venue the way
+ * JMap's `buildings.getDefault()` does: `defaultBuildingId`, else the first.
+ */
+export function defaultBuildingIdOf(rawVenue: Record<string, unknown>): number | null {
+	const explicit = Number(rawVenue.defaultBuildingId);
+	if (Number.isFinite(explicit) && explicit > 0) return explicit;
+	const items = (rawVenue.buildings as { items?: Array<{ id?: unknown }> } | undefined)?.items;
+	const first = Number(items?.[0]?.id);
+	return Number.isFinite(first) && first > 0 ? first : null;
 }
 
 /**
@@ -265,18 +538,9 @@ export async function loadVenue(cfg: JibestreamConfig, logger?: MapLogger): Prom
 	// pattern in getToken so a rejection from an old mount can't clobber a
 	// fresh venue cache entry installed by a concurrent new-mount loadVenue call.
 	const thisVenueCache: Promise<VenueData> = (async () => {
-		const token = await getToken(cfg, logger);
-		const url = new URL(
-			`${cfg.host}/JACS/api/customer/${cfg.customerId}/venue/${cfg.venueId}/full`,
-		);
-		if (cfg.mapProfileId != null) {
-			url.searchParams.set('mapProfileId', String(cfg.mapProfileId));
-		}
-		const res = await fetch(url.toString(), {
-			headers: { Authorization: `Bearer ${token}` },
-		});
-		if (!res.ok) throw new Error(`Jibestream venue fetch failed: ${res.status}`);
-		const raw = await res.json();
+		// Same request (and IndexedDB copy) the engine hands to JMap — fetched
+		// once, not once here and again inside JMap.
+		const raw = await fetchVenueJson(cfg, logger) as { id: number; name: string; destinations?: { items?: RawDestination[] } };
 		// Project the raw JACS destination items to the fields the SDK actually
 		// consumes ({id, name, locations:{mapId, waypointIds}}). The raw items
 		// carry large unprojected sub-objects (polygons, styling, etc.) that are
