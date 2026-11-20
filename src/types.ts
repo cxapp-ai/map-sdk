@@ -70,7 +70,9 @@ export interface JibestreamConfig {
 	/**
 	 * Required for service accounts without a default map profile — omitting
 	 * it when required surfaces as a 401 ("Map profile query param must be
-	 * present").
+	 * present"). Leave it unset otherwise: an account with a default profile
+	 * can reject it with a 401 ("Map profile query param is not allowed for
+	 * this user").
 	 */
 	mapProfileId?: number;
 	auth: JibestreamAuth;

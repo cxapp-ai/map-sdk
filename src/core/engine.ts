@@ -218,8 +218,9 @@ async function buildHostTokenAuth(
 	// With host-supplied tokens we don't have or want client credentials in the
 	// browser, but JMap will crash with "Cannot read properties of undefined (reading '0')"
 	// on construction unless `_` is present. Empty strings keep JMap's
-	// setCredentials happy without leaking secrets — JMap won't call
-	// /auth/token because our shim's getAccessToken intercepts the request.
+	// setCredentials happy without leaking secrets. JMap reads nothing else
+	// from this object and still POSTs /auth/token itself, so the `request`
+	// override (makeJacsRequest) has to answer that POST with our token.
 	const auth = {
 		_: ['', ''] as [string, string],
 		get token() { return currentToken; },
@@ -330,11 +331,14 @@ interface JacsRequestFn {
 }
 
 /**
- * JCore `request` override. Two responsibilities:
+ * JCore `request` override. Two independent responsibilities:
  *
  *   1. GET path: inject `?mapProfileId=N` into JACS URLs. JMap v4's URL
  *      builder appends `?v=4.12` but has no notion of map profiles, so
  *      service accounts that lack a default profile 401 on every call.
+ *      Skipped when `mapProfileId` is null: an account that has a default
+ *      profile can 401 on the param instead ("Map profile query param is
+ *      not allowed for this user").
  *
  *   2. POST path: short-circuit `/JACS/api/auth/token` requests. With a
  *      host-supplied token callback, JMap's own client_credentials POST
@@ -353,18 +357,20 @@ interface JacsRequestFn {
 // performing a real client_credentials exchange against the configured
 // clientId/clientSecret. Hijacking it with an empty token (the previous
 // behaviour) silently broke SDK-direct auth whenever mapProfileId was set.
-function makeJacsRequest(mapProfileId: number, getBearer?: () => Promise<string>): JacsRequestFn {
+function makeJacsRequest(mapProfileId: number | null, getBearer?: () => Promise<string>): JacsRequestFn {
 	const get = (opts: JacsRequestOpts, cb: JacsRequestCb): void => {
 		let finalUrl = opts.url;
-		try {
-			const u = new URL(opts.url);
-			if (!u.searchParams.has('mapProfileId')) {
-				u.searchParams.set('mapProfileId', String(mapProfileId));
+		if (mapProfileId != null) {
+			try {
+				const u = new URL(opts.url);
+				if (!u.searchParams.has('mapProfileId')) {
+					u.searchParams.set('mapProfileId', String(mapProfileId));
+				}
+				finalUrl = u.toString();
+			} catch {
+				const sep = opts.url.includes('?') ? '&' : '?';
+				finalUrl = `${opts.url}${sep}mapProfileId=${mapProfileId}`;
 			}
-			finalUrl = u.toString();
-		} catch {
-			const sep = opts.url.includes('?') ? '&' : '?';
-			finalUrl = `${opts.url}${sep}mapProfileId=${mapProfileId}`;
 		}
 		fetch(finalUrl, { headers: opts.headers ?? {} })
 			.then(async (res) => cb(null, { statusCode: res.status }, await res.text()))
@@ -974,19 +980,22 @@ export async function createMinimap(opts: CreateMinimapOpts): Promise<MinimapIns
 		customerId: cfg.customerId,
 		host: cfg.host,
 	};
-	if (cfg.mapProfileId != null) {
-		coreOpts.mapProfileId = cfg.mapProfileId;
-		// `request` overrides JMap's HTTP layer to inject mapProfileId into
-		// GET URLs. When the host also supplies a token (cfg.auth.getToken),
-		// the override additionally short-circuits the /JACS/api/auth/token
-		// POST — JMap would otherwise try a client_credentials exchange with
-		// the shim's empty clientId/clientSecret and 401. When no host token
-		// is supplied, the auth POST is forwarded so JMap performs its normal
-		// client_credentials exchange against the configured credentials.
-		const getBearer: (() => Promise<string>) | undefined = 'getToken' in cfg.auth
-			? () => getToken(cfg, opts.logger)
-			: undefined;
-		coreOpts.request = makeJacsRequest(cfg.mapProfileId, getBearer);
+	if (cfg.mapProfileId != null) coreOpts.mapProfileId = cfg.mapProfileId;
+	// `request` overrides JMap's HTTP layer, for either or both of two reasons:
+	//   - a map profile is set: inject mapProfileId into GET URLs;
+	//   - the host supplies a token (cfg.auth.getToken): short-circuit the
+	//     /JACS/api/auth/token POST — JMap would otherwise try a
+	//     client_credentials exchange with the shim's empty
+	//     clientId/clientSecret, 401, and never load the map. This applies
+	//     with or without a map profile.
+	// When no host token is supplied, the auth POST is forwarded so JMap
+	// performs its normal client_credentials exchange against the configured
+	// credentials; with neither reason, JMap keeps its own HTTP layer.
+	const getBearer: (() => Promise<string>) | undefined = 'getToken' in cfg.auth
+		? () => getToken(cfg, opts.logger)
+		: undefined;
+	if (cfg.mapProfileId != null || getBearer) {
+		coreOpts.request = makeJacsRequest(cfg.mapProfileId ?? null, getBearer);
 	}
 	// The auth-shim's background refresh timer is NOT armed yet — startAuthRefresh()
 	// arms it only after a fully successful mount (just before the return below), so
